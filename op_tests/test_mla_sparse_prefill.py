@@ -34,16 +34,9 @@ dtype column per candidate. Do not read the ratio as a like-for-like speedup.
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
 import triton
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_fp8_asm
-from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
-    _sparse_attn_prefill_kernel,
-)
-from aiter.test_common import benchmark, checkAllclose, run_perftest
 from test_pa_sparse_prefill_opus import (
     _FP8_D_HEAD,
     _FP8_D_NOPE,
@@ -55,6 +48,14 @@ from test_pa_sparse_prefill_opus import (
     _random_csr,
     _ref_pa_sparse_prefill_fp8,
 )
+
+import aiter
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_fp8_asm
+from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
+    _sparse_attn_prefill_kernel,
+)
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 # Deliberately NOT torch.set_default_device("cuda"): the CSR generators reused
 # from test_pa_sparse_prefill_opus build their index lists on the CPU with a CPU
@@ -175,11 +176,24 @@ def run_triton(q, pool, indices, indptr, attn_sink, softmax_scale):
         return (num_queries, triton.cdiv(num_heads, META["BLOCK_H"]))
 
     _sparse_attn_prefill_kernel[grid](
-        q, pool, indices, indptr, attn_sink, out,
-        q.stride(0), q.stride(1), q.stride(2),
-        pool.stride(0), pool.stride(1),
-        out.stride(0), out.stride(1), out.stride(2),
-        num_heads, head_dim, pool.shape[0], softmax_scale,
+        q,
+        pool,
+        indices,
+        indptr,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        pool.stride(0),
+        pool.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        num_heads,
+        head_dim,
+        pool.shape[0],
+        softmax_scale,
         HAS_ATTN_SINK=True,
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
@@ -256,7 +270,10 @@ def make_inputs(
         "merged": _merge_two_sources(
             ukv_fp32.to(torch.bfloat16),
             kv_fp32.to(torch.bfloat16),
-            ix_p, ip_p, ix_e, ip_e,
+            ix_p,
+            ip_p,
+            ix_e,
+            ip_e,
         ),
         "ref": {
             "q_fp32": q_fp32,
@@ -369,39 +386,67 @@ def main():
         description="config input of test",
     )
     parser.add_argument(
-        "-t", "--tokens", type=int, nargs="*", default=[1, 64, 256, 512, 1024],
+        "-t",
+        "--tokens",
+        type=int,
+        nargs="*",
+        default=[1, 64, 256, 512, 1024],
         help="query token counts (one workgroup each)",
     )
     parser.add_argument(
-        "-n", "--nhead", type=int, nargs="*", default=[_ASM_HEADS],
+        "-n",
+        "--nhead",
+        type=int,
+        nargs="*",
+        default=[_ASM_HEADS],
         help=f"head counts; the asm kernel only supports {_ASM_HEADS}",
     )
     parser.add_argument(
-        "-m", "--modes", type=str, nargs="*", default=list(_MODES),
+        "-m",
+        "--modes",
+        type=str,
+        nargs="*",
+        default=list(_MODES),
         help="CSR shape: sparse / dense / empty",
     )
     parser.add_argument(
-        "--spread", type=str, nargs="*", default=list(_SCALE_SPREADS),
+        "--spread",
+        type=str,
+        nargs="*",
+        default=list(_SCALE_SPREADS),
         help="E8M0 block-exponent spread within a row: varied / uniform",
     )
     parser.add_argument(
-        "--nnz", type=int, nargs="*", default=[0, 1, 31, 32, 33, 64, 96],
+        "--nnz",
+        type=int,
+        nargs="*",
+        default=[0, 1, 31, 32, 33, 64, 96],
         help="per-row nnz values for the tile-boundary sweep "
-             f"(asm SUB_KV={_ASM_SUB_KV})",
+        f"(asm SUB_KV={_ASM_SUB_KV})",
     )
     parser.add_argument(
-        "-p", "--nnz-prefix", type=int, nargs="*", default=[256, 1024],
+        "-p",
+        "--nnz-prefix",
+        type=int,
+        nargs="*",
+        default=[256, 1024],
         help="per-row prefix nnz for the explicit shape sweep",
     )
     parser.add_argument(
-        "-e", "--nnz-extend", type=int, nargs="*", default=[128],
+        "-e",
+        "--nnz-extend",
+        type=int,
+        nargs="*",
+        default=[128],
         help="per-row extend nnz for the explicit shape sweep",
     )
     parser.add_argument(
-        "--pool", type=int, default=4096,
+        "--pool",
+        type=int,
+        default=4096,
         help="prefix/extend pool rows for the explicit shape sweep. Must be >= the\n"
-             "largest per-row nnz, otherwise the index list wraps and every KV row\n"
-             "gets gathered several times per token.",
+        "largest per-row nnz, otherwise the index list wraps and every KV row\n"
+        "gets gathered several times per token.",
     )
     args = parser.parse_args()
 
@@ -458,12 +503,13 @@ def main():
         summarize(
             "mla_sparse_prefill -- explicit (prefix, extend) sweep",
             [
-                test_mla_sparse_prefill(
-                    t, h, pool, pool, "fixed", spread, npx, nex
-                )
+                test_mla_sparse_prefill(t, h, pool, pool, "fixed", spread, npx, nex)
                 for t, h, spread, npx, nex in itertools.product(
-                    args.tokens, args.nhead, args.spread,
-                    args.nnz_prefix, args.nnz_extend,
+                    args.tokens,
+                    args.nhead,
+                    args.spread,
+                    args.nnz_prefix,
+                    args.nnz_extend,
                 )
             ],
         )
