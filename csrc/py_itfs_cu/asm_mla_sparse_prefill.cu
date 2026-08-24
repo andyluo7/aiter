@@ -2,43 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // gfx1250 (MI400) DSA sparse-prefill MLA asm dispatcher.
-//
-// Registered in the mla_v4 family (hsa/<arch>/mla_v4/mla_v4_asm.csv) as the
-// prefill=1 row, so it shares that manifest and its generated config header
-// with the v4 sparse decode kernels. The kernarg ABI below is its own, though:
-// nothing is shared with the decode packet in asm_mla_v4.cu.
-//
-// This is the asm counterpart of the gfx950 OPUS HIP op
-// `pa_sparse_prefill_fp8_opus` (csrc/include/pa_sparse_prefill_opus.h). The
-// tensor contract is identical -- split fp8 NoPE / bf16 RoPE, two CSR-indexed
-// KV sources (paged "prefix" pool + this-forward "extend" pool), one fp32
-// per-head attn_sink folded into the softmax denominator -- so the two are
-// drop-in interchangeable from Python. Only the backend differs.
-//
-// Despite the name this is NOT a causal-prefill kernel: there is no qo_len /
-// kv_len / causal mask anywhere in it. Causality is pre-baked by the caller
-// into the two per-query-token CSR index lists. The M axis is *heads*, not
-// query tokens -- one workgroup serves exactly one query token x 128 heads.
-//
-// -----------------------------------------------------------------------------
-// kernarg ABI -- 104 bytes, tightly packed, NO 16B-slot padding
-// -----------------------------------------------------------------------------
-// Unlike the older asm MLA kernels (asm_mla.cu / asm_mla_v4.cu legacy path)
-// this kernel does NOT use the 16-byte-per-argument slot ABI, so there are no
-// p2/p3 filler members here. The layout below must match, byte for byte:
-//
-//   1. this struct,
-//   2. the `.args` block in the .co metadata
-//      (`llvm-readelf --notes hsa/gfx1250/pa_sparse_prefill/32mx4_32nx1.co`),
-//   3. the compile-time offsets the SP3 kernel preloads from
-//      (26 preloaded kernarg dwords; see 32mx4_32nx1.sp3 `DIRECT_PARAM`).
-//
-// A mismatch in (2) is what caused the historical gfx1250 MLA page fault: ROCr
-// copies only `.kernarg_segment_size` bytes, so anything the kernel reads past
-// that is unmapped memory. The offsetof asserts below pin (1) against (2).
-// aiter_tensor.h first: aiter_ctypes_error.h needs AITER_C_ITFS and
-// aiter_detail::g_aiter_can_throw from aiter_hip_common.h, which it does not
-// include itself.
+
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_mla_v4_configs.hpp"
@@ -67,10 +31,6 @@ struct __attribute__((packed)) MlaSparsePrefillKargs
     const void* kv_indptr_extend;  // 0x50  [T+1] int32
     const void* kv_indices_extend; // 0x58  [nnz_extend] int32
     float softmax_scale;           // 0x60  f32 by_value
-    // The 13 arguments end at 0x64, but .kernarg_segment_size is 104 (the
-    // segment is 8-byte aligned). Pad to the full segment so the buffer we
-    // hand the runtime is exactly what it copies; the SP3 side reserves the
-    // matching tail SGPR (s27) for this slot.
     unsigned int _tail_pad;        // 0x64
 };
 
@@ -144,18 +104,6 @@ void check_csr(const aiter_tensor_t* indptr,
 
 } // namespace
 
-// -----------------------------------------------------------------------------
-// Wrapped in AITER_CTYPES_DEFINE_ENTRYPOINT_VOID so AITER_CHECK failures (bad
-// arch, wrong H, dtype mismatch, missing kernel row) surface as a Python
-// RuntimeError through the aiter_get_last_error TLS bridge, instead of
-// std::abort()-ing the worker process.
-//
-// Argument order is the ctypes ABI: aiter/jit/core.py binds positionally off
-// the Python stub's signature, so aiter/ops/mla_sparse_prefill.py must
-// declare these in exactly this order. The order deliberately matches
-// pa_sparse_prefill_fp8_opus so the two ops are drop-in interchangeable; note
-// it is NOT the kernarg order (attn_sink/out sit at slots 6/7 in the packet).
-// -----------------------------------------------------------------------------
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     mla_sparse_prefill_fp8_asm_fwd,
     (aiter_tensor_t * q_nope,             // [T, H, 512] fp8
