@@ -46,31 +46,32 @@ and tuned JSON in `configs/`. Flag:
 
 ## Tuned configs: JSON placement and naming
 
-The config tree is mid-migration from a legacy flat layout
-(`configs/gemm/<arch>-<NAME>.json`) to a nested layout
-(`configs/<arch>/<backend>/<op>/<d_type>/`, e.g.
-`configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json`). The legacy layout is
-deprecated. Flag:
+Every tuned config lives in one nested layout,
+`configs/<arch>/<backend>/<op>/<d_type>/`, e.g.
+`configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json`. `<op>` is the op
+family (`gemm`, `moe`, `conv`, `attention`, `gmm`, `mhc`, `fusions`) and
+`<d_type>` is the config name lowercased with dashes folded to underscores. The
+flat, arch-prefixed layout is gone: `configs/` holds `CLAUDE.md` and the
+`<arch>/` directories, nothing else. Flag:
 
-- A new GEMM config JSON added under legacy `configs/gemm/` when the family
-  already has a nested `<arch>/<backend>/gemm/<d_type>/` directory, or a brand
-  new family added to the legacy layout instead of the nested one.
-- A config family split across the two layouts (e.g. `DEFAULT.json` nested but
-  new specialized files in `configs/gemm/`, or vice versa). The directory
-  probe in `get_gemm_config()` picks ONE directory — files in the losing
-  directory are silently ignored. Families move wholesale or not at all.
+- A config JSON added anywhere outside `configs/<arch>/...` — a recreated
+  `configs/gemm/`, `configs/moe/`, `configs/conv/` or `configs/hstu_attn/`, or
+  a loose `<arch>-<NAME>.json` at the top of `configs/`. Nothing probes those
+  paths, so the file is silently dead. (`configs/gemm/aot/` and
+  `configs/paged_mqa_logits/aot/` are runtime caches — see below.)
+- A config family split across two directories (e.g. `DEFAULT.json` in one
+  `<d_type>/` and new specialized files in another). The directory probe in
+  `resolve_config_dir()` picks ONE directory — files in the losing directory
+  are silently ignored. A family lives in exactly one directory.
 - An arch prefix on a filename inside `configs/<arch>/...` (wrong:
   `configs/gfx950/triton/gemm/x/gfx950-GEMM-X.json`), or a nested default file
   named anything other than exactly `DEFAULT.json`.
 - A specialized file added to a nested `<d_type>/` directory that contains no
   `DEFAULT.json` — the resolver probes only for the default, so the whole
   directory is invisible.
-- Any MOE config created or moved under `<arch>/<backend>/moe/`. No MOE
-  resolver for the nested layout exists yet; MOE configs stay in
-  `configs/moe/` with the arch prefix (see `configs/CLAUDE.md` §5).
 - Deleting or renaming `.gitkeep` placeholder directories under `configs/`.
 - A config file that is both moved and content-edited in the same commit —
-  migrations must be pure `git mv` renames, content changes in a follow-up.
+  a move must be a pure `git mv` rename, content changes in a follow-up.
 - `kpack` in a config file for gfx950 or a newer arch. Triton's AMD backend
   deprecates `kpack` starting from gfx950 — it warns and force-overrides
   `kpack = 1` there, and the parameter is slated for removal. Only gfx942
@@ -127,11 +128,16 @@ values for either backend live in JSON, never in Python. Flag:
   like `_get_config._config_dict` — instead of
   `aiter.ops.triton.utils.core.load_config_json` (which caches per path,
   including negative results) or the resolvers `get_gemm_config` /
-  `get_tuned_kernel_config`. All hand-rolled loaders were deliberately
-  removed; do not add them back.
+  `resolve_config_dir` / `get_tuned_kernel_config`. All hand-rolled loaders
+  were deliberately removed; do not add them back.
 - New hand-built config paths (`f"{AITER_TRITON_CONFIGS_PATH}/..."`) where
-  `get_gemm_config()` / `get_tuned_kernel_config()` would work — hand-built
-  paths break silently when the family migrates to the nested layout.
+  `get_gemm_config()` / `resolve_config_dir()` / `get_tuned_kernel_config()`
+  would work — hand-built paths break silently when a family's directory
+  changes.
+- A non-GEMM loader that rolls its own candidate-directory search instead of
+  calling `resolve_config_dir(op, config_name, backend=...)`. Conv, attention,
+  GMM, MHC and MOE all share that one probe; a second probe is how the layout
+  starts fragmenting again.
 
 ## Weight & scale shuffling — must come from `utils/shuffle.py`
 

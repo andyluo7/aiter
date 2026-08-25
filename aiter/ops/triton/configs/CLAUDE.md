@@ -1,38 +1,36 @@
 # Triton kernel configs — rules for automated edits
 
-Scope: **GEMM and MOE configs only.** Read this before adding, moving,
-renaming, or tuning a GEMM or MOE JSON file under
-`aiter/ops/triton/configs/`, or before touching
-`utils/gemm_config_utils.py` or `utils/moe_config_utils.py`.
+Scope: **every tuned JSON file under `aiter/ops/triton/configs/`.** Read this
+before adding, moving, renaming, or tuning one, or before touching a loader
+under `utils/` (`gemm_config_utils.py`, `moe_config_utils.py`,
+`conv_config_utils.py`, `mhc_config_utils.py`, `tuned_config_utils.py`).
 
-Out of scope, do not touch without an explicit request: `configs/conv/`,
-`configs/hstu_attn/`, and the flat attention / GMM / MHC / MLA files at the top
-of `configs/`. They have their own loaders and are unaffected by anything here.
+Out of scope, do not touch without an explicit request: the two AOT directories
+built at runtime — see the end of §6. Every checked-in family (GEMM, MOE, conv,
+attention, GMM, MHC) is covered here.
 
-Every GEMM family now lives in the nested `<arch>/<backend>/<op>/<d_type>/`
-layout, and the flat, arch-prefixed fallback has been removed from
-`get_gemm_config()` — a GEMM config outside the nested layout no longer
-resolves. **MOE is still flat** (`configs/moe/`, arch-prefixed) and stays that
-way until `get_moe_config()` lands; see §5.
+There is one layout. Every family lives in the nested
+`<arch>/<backend>/<op>/<d_type>/` tree, every loader resolves through the same
+probe, and the flat, arch-prefixed layout is gone: `configs/` now holds this
+file and the `<arch>/` directories, nothing else. A config outside the nested
+layout does not resolve.
 
 Two non-negotiables:
 
 1. **Tuning values live in JSON, never in Python.** No `setdefault`, no inline
    dict literals, no arch-conditional constants, no hardcoded fallback configs.
    If a value is missing, fix the JSON.
-2. **New GEMM configs go in the nested layout.** It is the only layout
-   `get_gemm_config()` reads. MOE is the exception (§5).
+2. **New configs go in the nested layout.** It is the only layout any resolver
+   reads.
 
-`GEMM-AFP4WFP4` (gfx950 triton, gfx950/gfx1250 gluon) and
-`GEMM-AFP4WFP4_PRESHUFFLED` (gfx950/gfx1250 triton) are the migrated
-families; `GEMM-AFP4WFP4` is the worked reference — copy its shape when in
-doubt.
+`GEMM-AFP4WFP4` (gfx950 triton, gfx950/gfx1250 gluon) is the worked reference
+— copy its shape when in doubt.
 
 ---
 
 ## 1. Layouts
 
-### Target layout (use for all new configs)
+### The layout — every op, every arch
 
 ```
 configs/<arch>/<backend>/<op>/<d_type>/DEFAULT.json
@@ -41,9 +39,9 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 
 | Segment     | Values                                                    |
 | ----------- | --------------------------------------------------------- |
-| `<arch>`    | `gfx942`, `gfx950`, `gfx1250`, `gfx1151`, `gfx1200`, `gfx1201` |
+| `<arch>`    | `gfx942`, `gfx950`, `gfx1100`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
 | `<backend>` | `triton` or `gluon`                                        |
-| `<op>`      | `gemm` or `moe`                                            |
+| `<op>`      | `gemm`, `moe`, `conv`, `attention`, `gmm`, `mhc`, `fusions` — the op family, which is not always the wrapper's category folder (MHC's wrapper lives in `fusions/`, its configs in `mhc/`) |
 | `<d_type>`  | `config_name.lower().replace("-", "_")` — `GEMM-AFP4WFP4` → `gemm_afp4wfp4`. The transform lives in `gemm_config_utils._dtype_dir()` |
 | filename    | **no arch prefix** — the arch is the directory. The default is literally `DEFAULT.json`; specialized files keep the `<CONFIG_NAME>-` stem |
 
@@ -52,53 +50,58 @@ configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json
 configs/gfx950/triton/gemm/gemm_afp4wfp4/GEMM-AFP4WFP4-N=8192-K=8192.json
 configs/gfx950/gluon/gemm/gemm_afp4wfp4/DEFAULT.json
 configs/gfx1250/gluon/gemm/gemm_afp4wfp4/DEFAULT.json
+configs/gfx950/triton/moe/moe_fp8_w8a8/DEFAULT.json
+configs/gfx1201/triton/conv/conv_3x3_nhwc/DEFAULT.json
+configs/gfx950/triton/mhc/mhc_fused_sinkhorn/MHC_FUSED_SINKHORN-C=7168.json
 ```
 
-The `<arch>/<backend>/moe/` directories exist but are empty, held open with
-`.gitkeep`. Keep them. **No MOE config has been migrated and no MOE resolver
-understands the nested layout yet** — see §5.
+A handful of `.gitkeep` files hold directories open: `<arch>/gluon/moe/` on
+gfx950 and gfx1250 is genuinely empty, and the placeholders under
+`gfx1250/triton/gemm/`, `gfx950/triton/moe/` and `gfx1250/triton/moe/` outlived
+the directories filling up. Keep them all — do not rename or delete a
+`.gitkeep`.
 
-### Legacy layout — deprecated, pending removal
+### The flat layout is gone
 
-```
-configs/gemm/<arch>-<CONFIG_NAME>[-<suffix>].json
-configs/gemm/gluon/<arch>-<CONFIG_NAME>[-<suffix>].json
-configs/moe/<arch>-MOE-<dtype_str>.json
-configs/moe/<arch>-A8W4.json
-configs/moe/<arch>-MOE_ROUTING_SIGMOID_TOPK1.json
-```
+Configs used to live flat and arch-prefixed: `configs/gemm/<arch>-<NAME>.json`
+(plus `configs/gemm/gluon/`), `configs/moe/<arch>-MOE-<dtype_str>.json`,
+`configs/conv/<arch>-CONV-<KERNEL>.json`, `configs/hstu_attn/`, and loose
+`<arch>-<NAME>.json` files for attention, GMM and MHC at the top of `configs/`.
+None of those directories or files exist any more and no resolver probes for
+them, so a file dropped there is dead weight — it will not be found and nothing
+will warn you.
 
-Regenerate rather than trusting this listing:
+Enumerate what actually ships rather than trusting a listing in this document:
 `git ls-tree -r --name-only HEAD aiter/ops/triton/configs/`
-
-Still authoritative for every family not yet migrated. For GEMM it is reached
-through the fallback chain in §2; for MOE it is the *only* path that works.
-The GEMM fallback is temporary — anything left in `configs/gemm/` when the
-legacy candidates are dropped from `gemm_config_utils.py` will stop resolving.
 
 ---
 
-## 2. GEMM resolution order — `get_gemm_config()`
+## 2. Resolution order — `resolve_config_dir()`
 
-`utils/gemm_config_utils.py` picks a directory by probing for the *default*
-config file (`DEFAULT.json` in the nested layout, `<arch>-<CONFIG_NAME>.json`
-in legacy) in order and taking the first hit. Specialized files are then read
-from that same directory.
+Every op resolves through one shared probe,
+`gemm_config_utils.py::resolve_config_dir()`. It picks a directory by probing
+candidates for the family's *default* config file (`DEFAULT.json`) in order
+and taking the first hit; specialized files are then read from that same
+directory. `get_gemm_config()` wraps it for GEMM; conv, attention, GMM, MHC
+and MOE call it directly and parse their own schemas (§5).
 
-**`backend=None`** (what every caller uses today):
+**`backend=None`**:
 
-1. `configs/<arch>/triton/gemm/<d_type>/DEFAULT.json`
-2. `configs/<arch>/gluon/gemm/<d_type>/DEFAULT.json`
+1. `configs/<arch>/triton/<op>/<d_type>/DEFAULT.json`
+2. `configs/<arch>/gluon/<op>/<d_type>/DEFAULT.json`
 
-**`backend="triton"|"gluon"`**:
+**`backend="triton"|"gluon"`** (what every non-GEMM caller passes):
 
-1. `configs/<arch>/<backend>/gemm/<d_type>/DEFAULT.json`
+1. `configs/<arch>/<backend>/<op>/<d_type>/DEFAULT.json`
 
 If nothing matches, the last candidate is used and the missing-default
 assertion fires there, naming the nested path the file should have had.
 
-`resolve_config_dir()` still accepts `legacy_dir` — unused by GEMM, kept for
-the MOE unification described in §5.
+Two parameters exist for the edges. `arch=` overrides the running
+architecture, for a loader that retries under another arch when the running
+one ships no tuned configs — MHC's gfx942 fallback is the only user.
+`legacy_dir=` appends flat, arch-prefixed candidates; nothing passes it any
+more and no flat directory survives for it to find.
 
 Consequences to keep in mind:
 
@@ -127,7 +130,10 @@ Direct-path loaders bypass the resolver's directory probe. Grep for
 filtering, so it calls `resolve_config_dir()` directly instead of
 `get_gemm_config()` — it is on the shared probe and needs no path edits.
 `gluon/gemm_a8w8.py` and `gluon/gemm_afp4wfp4.py` go through
-`get_gemm_config(backend="gluon")`.
+`get_gemm_config(backend="gluon")`. `utils/tuned_config_utils.py` builds its
+own nested path rather than probing — it takes `op` and `backend` from the
+caller, so there is only ever one candidate — but the layout it builds is the
+same one.
 
 ---
 
@@ -185,12 +191,12 @@ had tuned, and made the effective config un-inspectable from the JSON.
 
 ## 4. GEMM naming
 
-| Kind              | Target layout                                   | Legacy layout                                        |
-| ----------------- | ----------------------------------------------- | ---------------------------------------------------- |
-| Default           | `gemm_a16w16/DEFAULT.json`                       | `gfx950-GEMM-A16W16.json`                             |
-| N/K specialized   | `gemm_a16w16/GEMM-A16W16-N=256-K=7168.json`      | `gfx950-GEMM-A16W16-N=256-K=7168.json`                |
-| Batched (B, N, K) | `batched_gemm_a16w16/BATCHED_GEMM-A16W16-B=4-N=1024-K=4096.json` | `gfx1250-BATCHED_GEMM-A16W16-B=4-N=1024-K=4096.json` |
-| Custom suffix     | `fused_gemm_afp4wfp4_a16w16/FUSED-GEMM-AFP4WFP4-A16W16-N4=512-N16=256-K=7168.json` | same, arch-prefixed         |
+| Kind              | Path under `<arch>/<backend>/gemm/`                              |
+| ----------------- | ---------------------------------------------------------------- |
+| Default           | `gemm_a16w16/DEFAULT.json`                                        |
+| N/K specialized   | `gemm_a16w16/GEMM-A16W16-N=256-K=7168.json`                       |
+| Batched (B, N, K) | `batched_gemm_a16w16/BATCHED_GEMM-A16W16-B=4-N=1024-K=4096.json`  |
+| Custom suffix     | `fused_gemm_afp4wfp4_a16w16/FUSED-GEMM-AFP4WFP4-A16W16-N4=512-N16=256-K=7168.json` |
 
 The `<d_type>` directory name is `config_name.lower().replace("-", "_")`.
 Dashes, underscores, and case all fold together, so new config names must stay
@@ -206,21 +212,44 @@ files by the packed byte width will never be found.
 
 ---
 
-## 5. MOE configs
+## 5. The non-GEMM ops
 
-MOE does **not** go through `get_gemm_config()`. There is no probe order, no
-nested-layout support, and no `is_tuned` signal. Four independent loaders read
-`configs/moe/` directly, each with its own schema:
+Everything outside GEMM finds its directory the same way — `resolve_config_dir()`
+(§2), or the identical nested path built by `get_tuned_kernel_config()` — and
+then parses its own file. Path resolution is all these loaders share with
+`get_gemm_config()`: no common schema, and no common `is_tuned` signal.
 
-| Loader | File | Schema |
-| ------ | ---- | ------ |
-| `utils/moe_config_utils.py::get_moe_configs` | `moe/<arch>-MOE-<dtype_str>.json` | `small_M` / `medium_M` / `large_M` |
-| `moe/moe_op_gemm_a8w4.py::_get_a8w4_dispatch` | `moe/<arch>-A8W4.json` | `bm<block_m>_n<N>_k<K>` |
-| `moe/moe_op_gemm_a4w4.py::_get_a4w4_dispatch` | `moe/<arch>-A4W4.json` | `bm<block_m>_n<N>_k<K>_<bucket>` |
-| `_triton_kernels/moe/moe_routing_sigmoid_top1_fused.py` | `moe/<arch>-MOE_ROUTING_SIGMOID_TOPK1.json` | `N16` → `small` / `medium` / … |
+| Op | Loader | `<d_type>` directories | Selection within the file |
+| -- | ------ | ---------------------- | ------------------------- |
+| `conv` | `utils/conv_config_utils.py::get_conv_config` | `conv_1x1`, `conv_3x3_nhwc`, `conv_3x3_cblocked`, `conv_general`, `conv_wino_f4x3_{input,gemm,output}` | `shapes[<shape_key>]` → `M_LEQ_x` → `any` |
+| `attention` | seven modules under `_triton_kernels/attention/`; `chunk_delta_attn` instead goes through `utils/tuned_config_utils.py::get_tuned_kernel_config` | `mha`, `extend_attention`, `mla_decode_rope`, `leanattn`, `hstu_attn_fwd`, `hstu_attn_bwd`, `chunk_delta_attn` | per module |
+| `gmm` | `_triton_kernels/gmm.py::get_config` | `gmm` | variant (`gmm`/`ptgmm`/`nptgmm`) → `default` / `accumulate` |
+| `mhc` | `utils/mhc_config_utils.py` | `mhc_fused_sinkhorn`, `mhc_post` | C-specialized file, then `M_LEQ_x` → `any` |
+| `moe` | four loaders, below | `moe_<dtype_str>`, `a8w4`, `a4w4`, `moe_routing_sigmoid_topk1` | one schema per loader, below |
+
+Mind the directory names: the redundant `-DEFAULT` the flat filenames carried
+(`gfx942-MHA-DEFAULT.json`) is not part of `<d_type>` — the file inside is
+already `DEFAULT.json`, so the directory is `mha`, not `mha_default`.
+
+MHC is the one loader that resolves a *foreign* arch's directory: an arch with
+no tuned MHC configs retries under gfx942 through the `arch=` parameter of §2,
+so both `mhc_fused_sinkhorn` directories have to stay complete.
+
+### MOE
+
+Four independent loaders resolve `op="moe"` with `backend="triton"` and read
+`DEFAULT.json` out of the directory they get back, each parsing its own schema:
+
+| Loader | Config directory | Schema |
+| ------ | ---------------- | ------ |
+| `utils/moe_config_utils.py::get_moe_configs` | `<arch>/triton/moe/moe_<dtype_str>/` | `small_M` / `medium_M` / `large_M` |
+| `moe/moe_op_gemm_a8w4.py::_get_a8w4_dispatch` | `<arch>/triton/moe/a8w4/` | `bm<block_m>_n<N>_k<K>` |
+| `moe/moe_op_gemm_a4w4.py::_get_a4w4_dispatch` | `<arch>/triton/moe/a4w4/` | `bm<block_m>_n<N>_k<K>_<bucket>` |
+| `_triton_kernels/moe/moe_routing_sigmoid_top1_fused.py` | `<arch>/triton/moe/moe_routing_sigmoid_topk1/` | `N16` → `small` / `medium` / … |
 
 `<dtype_str>` comes from `get_config_dtype_str()`: `DEFAULT`, `FP8_W8A8`,
-`INT8_W8A16`, `INT8_W8A8`, `INT4_W4A16`, `MX_FP4`.
+`INT8_W8A16`, `INT8_W8A8`, `INT4_W4A16`, `MX_FP4`; lowercased into the
+directory name, so `MOE-FP8_W8A8` resolves to `moe_fp8_w8a8/`.
 
 `small_M` / `medium_M` / `large_M` split on `M_THRESHOLD_SMALL = 256` and
 `M_THRESHOLD_MEDIUM = 1024`, both module constants in `moe_config_utils.py`.
@@ -234,6 +263,10 @@ path still computes its config in Python. Its `<bucket>` is a *third* M scheme �
 falls all the way through to `_any` and loses the shape's tuning, a tuned shape
 must supply **all six** buckets, even where the values repeat.
 
+Both `a4w4/` and `a8w4/` sit under `<arch>/triton/` even though A4W4 serves the
+gluon kernel: their loaders pass `backend="triton"`, so that is the only
+candidate the probe looks at.
+
 ### MOE is the main offender for tuning values in Python
 
 Fix these as you touch them; do not add more:
@@ -246,146 +279,104 @@ Fix these as you touch them; do not add more:
   shape heuristic → a conservative default. Only the first tier reads tuned
   numbers from JSON.
 
-### Planned: `get_moe_config()` — design, not yet implemented
+### There is no `get_moe_config()`
 
-**Status: design only. Nothing below exists in the tree yet.** Do not assume
-`get_moe_config` is importable; do not move MOE JSON files in anticipation of
-it. If you are asked to implement it, follow this shape.
+An earlier revision of this file specified one. It was not written. The four
+loaders reuse `resolve_config_dir()` — the shared probe that already existed —
+rather than getting a wrapper of their own, and MOE's unification was
+**path resolution only**: the schemas above were left exactly as they are, each
+caller still parses its own, and converging them stays a separate decision that
+would touch every MOE config file and require re-validating dispatch on every
+arch.
 
-The unification is **path resolution only.** The three MOE schemas stay as they
-are — the loader finds and parses the file, each caller keeps interpreting its
-own structure. Converging the schemas is a separate, later decision (it would
-touch every MOE config file and require re-validating dispatch on every arch).
-
-**Step 1 — extract the shared probe.** The candidate-directory logic currently
-inlined in `_get_gemm_config_cached()` becomes a helper in `utils/`, parameterised
-on `<op>`:
+The probe they call:
 
 ```python
 def resolve_config_dir(op: str, config_name: str, backend: str | None = None,
-                       legacy_dir: str | None = None) -> tuple[str, str]:
+                       legacy_dir: str | None = None,
+                       arch: str | None = None) -> tuple[str, str]:
     """Return (cfg_dir, name_prefix) for the first candidate whose default
     file exists: DEFAULT.json when name_prefix is empty (the nested layout,
     dir from _dtype_dir()), else <name_prefix><config_name>.json. Falls back
-    to the last candidate so the missing-file assertion names a legacy path."""
+    to the last candidate so the missing-file assertion names a legacy path.
+    ``arch`` overrides the running architecture, for loaders that retry under
+    another arch when the running one has no tuned configs."""
 ```
 
-Candidates for `op="moe"`, mirroring §2:
+With `backend="triton"` and no `legacy_dir` there is exactly one candidate and
+the returned name prefix is always `""`, so the file is always `DEFAULT.json`.
 
-- `backend=None` → `<arch>/triton/moe/<d_type>/DEFAULT.json`,
-  `<arch>/gluon/moe/<d_type>/DEFAULT.json`, then legacy `configs/moe/` with
-  the `<arch>-` prefix
-- `backend=...` → `<arch>/<backend>/moe/<d_type>/DEFAULT.json`, then legacy
-  `configs/moe/` prefixed
-
-`<d_type>` comes from the unprefixed stem via the same transform:
-`MOE-FP8_W8A8` → `moe_fp8_w8a8`, `A8W4` → `a8w4`,
-`MOE_ROUTING_SIGMOID_TOPK1` → `moe_routing_sigmoid_topk1`.
-
-`gemm_config_utils.py` is then refactored onto the same helper with `op="gemm"`
-and `legacy_dir="gemm"` — behaviour-identical, and the legacy candidates stay
-tagged `# TODO(satya): legacy, remove` so both ops retire together.
-
-**Step 2 — the loader.**
-
-```python
-def get_moe_config(config_name: str, backend: str | None = None) -> dict | None:
-    """Load a MOE config by name. Returns the parsed JSON (a deep copy, safe to
-    mutate), or None if no file exists for this arch. Schema interpretation is
-    the caller's job — MOE files are not uniform."""
-```
-
-- `config_name` is the unprefixed stem: `MOE-FP8_W8A8`, `MOE-DEFAULT`, `A8W4`,
-  `MOE_ROUTING_SIGMOID_TOPK1`.
-- Cache with `functools.lru_cache` and deep-copy on return, exactly as
-  `get_gemm_config()` does — callers mutate configs.
-- Return `None` rather than raising: unlike GEMM, a missing MOE config is
-  currently normal (only gfx942 and gfx950 ship any).
-- No `is_tuned` flag. MOE has no default-vs-specialized distinction to report.
-
-**Step 3 — port the three loaders** onto it, one PR each, without changing
-schemas or file locations:
-
-| Loader | Call becomes |
-| ------ | ------------ |
-| `moe_config_utils.py::get_moe_configs` | `get_moe_config(f"MOE-{dtype_str}")` |
-| `moe_op_gemm_a8w4.py::_get_a8w4_dispatch` | `get_moe_config("A8W4") or {}` |
-| `moe_routing_sigmoid_top1_fused.py` | `get_moe_config("MOE_ROUTING_SIGMOID_TOPK1")` |
-
-**Step 4 — delete the hardcoded Python fallbacks.** Blocked on shipping a
-`<arch>-MOE-DEFAULT.json` for the arches that have none — today only gfx942 and
-gfx950 have MOE configs at all, so gfx1250/gfx1151/gfx1200/gfx1201 hit the
-hardcoded dict in `get_optimal_moe_config()`. Once every supported arch has a
-file, that dict and the `warnings.warn` come out.
-
-**Step 5 — only now `git mv`** MOE files into `<arch>/<backend>/moe/` and drop
-the arch prefix, following §6.
-
-Moving MOE JSON before step 2 lands would silently break resolution, and the
-Python fallbacks would swallow the breakage instead of surfacing it.
+What is still open is the Python fallback tiers above, not the resolution path.
+They were deliberately left in place through the migration so that a resolution
+regression could not be swallowed by them. Retiring them is blocked on shipping
+a `moe_default/DEFAULT.json` for every supported arch — today only gfx942,
+gfx950 and gfx1250 ship any MOE config at all, and only gfx942 and gfx950 ship
+`moe_default`, so everything else lands on the hardcoded dict in
+`get_optimal_moe_config()`.
 
 ---
 
-## 6. Migration playbook (GEMM)
+## 6. Adding a config
 
 One family = one `<arch>` × `<backend>` × `<CONFIG_NAME>`, including every
-specialized file. `GEMM-AFP4WFP4` is the worked example — diff it against its
-legacy form if a step is ambiguous.
+specialized file. `GEMM-AFP4WFP4` is the worked example — copy its shape if a
+step is ambiguous.
 
-1. **Scope it.** `ls configs/gemm/<arch>-<CONFIG_NAME>*.json` — the default plus
-   every specialized file. All of them move together.
-2. **Find every reader.** Grep for the config name and for
-   `AITER_TRITON_CONFIGS_PATH` in `aiter/ops/triton/`. Hand-built paths must be
-   rewritten; `get_gemm_config()` callers need no change.
-3. **Move with `git mv`** so the change reviews as a rename. Strip the
-   `<arch>-` prefix; the default file becomes `DEFAULT.json`, specialized
-   files keep the `<CONFIG_NAME>-` stem:
-   ```
-   git mv configs/gemm/gfx950-GEMM-FOO.json \
-          configs/gfx950/triton/gemm/gemm_foo/DEFAULT.json
-   git mv configs/gemm/gfx950-GEMM-FOO-N=1-K=2.json \
-          configs/gfx950/triton/gemm/gemm_foo/GEMM-FOO-N=1-K=2.json
-   ```
-   `mkdir` the `<d_type>/` directory first; it needs no `.gitkeep` (it is
-   created populated). Create `<arch>/<backend>/{gemm,moe}/` with a `.gitkeep`
-   if absent.
-4. **Do not edit contents in the same commit.** Keep renames at 100% similarity;
-   content changes go in a follow-up commit.
-5. **Update docs.** `aiter/ops/triton/README.md` ("How GEMM configs resolve",
-   "Config naming") and `aiter/ops/triton/utils/_triton/tunning/README.md`
-   (the copy step under "Verify performance") both describe the two layouts —
-   keep them current if a migration changes what they say.
-6. **Pull any tuning values still hardcoded in Python into the JSON.** A
-   migrated family must be fully described by its config files.
-7. **Verify** on the target arch: config resolves, `is_tuned` is `True` for a
-   shape that has a specialized file, and numerics are unchanged.
-8. The GEMM legacy fallback is gone: `get_gemm_config()` reads the nested
-   layout only, so a family that is not fully moved stops resolving. There is
-   no fallback left to lean on mid-migration.
+1. **Pick the directory.** `configs/<arch>/<backend>/<op>/<d_type>/`, with
+   `<d_type>` = `config_name.lower().replace("-", "_")`. If the family already
+   has a directory, the new file goes in that one — never a second directory
+   for the same family.
+2. **Name the file.** No arch prefix; the arch is the directory. The default is
+   literally `DEFAULT.json`, and a specialized file keeps the `<CONFIG_NAME>-`
+   stem plus its suffix (`GEMM-A16W16-N=256-K=7168.json`).
+3. **Ship the `DEFAULT.json` first.** A `<d_type>/` directory holding only
+   specialized files is invisible: the probe keys on `DEFAULT.json`, falls
+   through to the next candidate, and ignores everything in the directory.
+   `mkdir` the `<d_type>/` directory as part of adding its first file; it needs
+   no `.gitkeep` (it is created populated).
+4. **Find every reader.** Grep for the config name and for
+   `AITER_TRITON_CONFIGS_PATH` in `aiter/ops/triton/`. `get_gemm_config()` and
+   `resolve_config_dir()` callers need no change; hand-built paths do.
+5. **If the file is moving, move it with `git mv`** so the change reviews as a
+   rename, and do not edit contents in the same commit — renames stay at 100%
+   similarity, content changes go in a follow-up.
+6. **Pull any tuning values still hardcoded in Python into the JSON.** A family
+   must be fully described by its config files.
+7. **Verify** on the target arch: the config resolves, `is_tuned` is `True` for
+   a shape that has a specialized file, and numerics are unchanged.
+8. **Update the docs** if the change touches a convention:
+   `aiter/ops/triton/README.md` ("Tuned configs"),
+   `.github/instructions/aiter-ops-triton.instructions.md` (the Copilot review
+   rules, expected to stay in sync with that README), and
+   `aiter/ops/triton/utils/_triton/tunning/README.md` (the copy step under
+   "Verify performance").
 
-### Adding a *new* tuned config (no migration)
+### A new op family
 
-- **GEMM**, new arch/backend combination or a family already migrated →
-  target layout, inside the family's `<d_type>/` directory (`DEFAULT.json`
-  for the default; specialized files keep the config-name stem, no arch
-  prefix).
-- **GEMM**, family still in `configs/gemm/` → add to `configs/gemm/` with the
-  arch prefix, and consider migrating the whole family in the same PR. Never
-  create a lone nested file for a family whose default lives in legacy; the
-  directory probe picks one directory and ignores the other.
-- **MOE** → `configs/moe/` with the arch prefix, matching the schema of the
-  loader that will read it. The nested layout is not wired up for MOE.
+A family whose `<op>` segment does not exist yet needs the directory and a
+loader that calls `resolve_config_dir("<op>", "<CONFIG_NAME>",
+backend="triton")` — nothing else. Do not write a second probe: `conv`,
+`attention`, `gmm`, `mhc` and `moe` were all wired up this way, and the shared
+probe is what keeps every family findable under one set of rules. A kernel that
+only needs one pinned tile per arch, rather than a per-shape lookup, uses
+`utils/tuned_config_utils.py::get_tuned_kernel_config()` instead — same layout,
+same `DEFAULT.json`.
 
 ### Do not
 
 - Rename or delete `.gitkeep` placeholder directories.
 - Put an arch prefix on a file inside `<arch>/...`, or name a nested default
   anything other than `DEFAULT.json`.
+- Recreate a flat, arch-prefixed config directory — `configs/gemm/`,
+  `configs/moe/`, `configs/conv/`, `configs/hstu_attn/`, or loose
+  `<arch>-<NAME>.json` files at the top of `configs/`. Nothing probes them any
+  more. (The runtime AOT caches below write under `configs/gemm/aot/` and
+  `configs/paged_mqa_logits/aot/`; those are not config directories and are
+  never checked in.)
 - Put tuning values in `.py` files — no `setdefault`, no inline dicts, no
   arch-conditional constants, no hardcoded fallback configs.
 - Mix the GEMM `M_LEQ_x`/`M_GEQ_y` scheme with the MOE
   `small_M`/`medium_M`/`large_M` scheme.
-- Move MOE configs into `<arch>/<backend>/moe/` before a resolver exists.
 
 ### Not tuning configs
 

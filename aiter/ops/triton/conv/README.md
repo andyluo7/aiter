@@ -209,13 +209,15 @@ Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`
 
 ### Tuning
 
-Per-kernel configs ship as JSON under `aiter/ops/triton/configs/conv/`, one
-file per `(arch, kernel)` — e.g. `gfx1201-CONV-3X3-NHWC.json`. The loader walks
+Per-kernel configs ship as JSON under `aiter/ops/triton/configs/<arch>/triton/conv/`,
+one `DEFAULT.json` per `(arch, kernel)` — e.g.
+`gfx1201/triton/conv/conv_3x3_nhwc/DEFAULT.json`. The loader walks
 three tiers: literal shape pin → `M_LEQ_x` bucket → `"any"` fallback. No
 runtime autotune in the hot path, so CI compile time stays predictable and
 the first call hits no tuning tax.
 
-Tuned for RDNA4 today (configs ship as `gfx1201-*.json` and `gfx1200-*.json`).
+Tuned for RDNA4 today (configs ship under `gfx1201/triton/conv/` and
+`gfx1200/triton/conv/`).
 
 If you need to retune at runtime (e.g. while developing a new kernel), set
 `AITER_TRITON_CONV_AUTOTUNE=1` — this restores the original `@triton.autotune`
