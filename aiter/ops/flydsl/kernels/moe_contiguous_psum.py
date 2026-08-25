@@ -33,6 +33,10 @@ MAX_EXPERTS_PER_BLOCK = 512
 # loop stays correct for any token count.
 EP_REMAP_NBLK = 256
 
+# Same for the non-EP remap. One block (512 lanes) left the row remap latency-bound
+# on a 256-CU part: at 32K padded tokens that is ~768 dependent iterations per lane.
+REMAP_NBLK = 256
+
 
 @fx.struct
 class _PsumStorage:
@@ -334,7 +338,15 @@ def build_moe_contiguous_psum_remap_module():
                     ptr_rsrc(num_valid_routes), fx.Uint32(0), vec_width=1, dtype=i32
                 )
             )
-        for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
+        # Grid-strided over REMAP_NBLK blocks. No cross-block sync is needed even
+        # though the scatter reads starts[] back from global: every block runs the
+        # whole scan above and stores the same starts/psum values, so a block only
+        # ever reads entries it wrote itself before its own barrier. The duplicate
+        # stores race, but each writes the identical value.
+        gtid = fx.Uint32(fx.block_idx.x) * MAX_EXPERTS_PER_BLOCK + tid
+        for route_i32 in range(
+            gtid, valid_route_count, REMAP_NBLK * MAX_EXPERTS_PER_BLOCK
+        ):
             row_raw = buffer_ops.buffer_load(
                 rows_rsrc, route_i32, vec_width=1, dtype=i32
             )
@@ -379,7 +391,7 @@ def build_moe_contiguous_psum_remap_module():
             tile_m,
             num_valid_routes,
         ).launch(
-            grid=(arith.index(1), 1, 1),
+            grid=(arith.index(REMAP_NBLK), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
             stream=stream,
         )
