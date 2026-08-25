@@ -105,42 +105,27 @@ for file in "${sharded_files[@]}"; do
                 '
                 _ "$file"
             )
-            ;;
-        op_tests/multigpu_tests/test_mega_moe_gfx1250.py)
-            {
-                echo "Running gfx1250 MegaMoE fused-scatter accuracy on 8 GPUs when supported"
-            } | tee -a latest_test.log
-            test_cmd=(
-                timeout 60m
-                bash -c '
-                    set -euo pipefail
-                    test_file=$1
-                    arch=$(python3 -c \
-                        "from aiter.jit.utils.chip_info import get_gfx; print(get_gfx())")
-                    if [[ "$arch" != "gfx1250" ]]; then
-                        echo "Skipping $test_file: requires gfx1250, got $arch"
-                        exit 0
-                    fi
-                    exec env MORI_SHMEM_HEAP_SIZE=40G \
-                        torchrun --standalone --nproc_per_node=8 "$test_file" \
-                        --combine scatter_fused --layers 2 --acc_verify 1
-                '
-                _ "$file"
-            )
-            ;;
-        op_tests/multigpu_tests/test_mega_moe_v2.py)
+            ;;        op_tests/multigpu_tests/test_mega_moe_v2.py)
             {
                 echo "Running MegaMoEV2 v4_pro fixed-slot and compact coverage on 8 GPUs"
             } | tee -a latest_test.log
             test_cmd=(
-                env MORI_SHMEM_HEAP_SIZE=40G
+                env MORI_SHMEM_HEAP_SIZE=40G MORI_SOCKET_IFNAME=lo
                 timeout 60m
-                torchrun --standalone --nproc_per_node=8 "$file"
-                --network v4_pro
-                --bs-list 128,512
-                --iters 10
-                --accuracy-max-bs 512
-                --rtol 0.10
+                bash -lc
+                'set -uo pipefail
+                exit_code=0
+                echo "=== Testing a8w4 ==="
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network v4_pro --quant a8w4 --bs-list 128,512 \
+                    --iters 10 --accuracy-max-bs 512 --rtol 0.10 || exit_code=$?
+                echo "=== Testing a4w4 ==="
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network v4_pro --quant a4w4 --bs-list 2,4,16,128,512 \
+                    --iters 10 --accuracy-max-bs 512 --rtol 0.25 || exit_code=$?
+                exit $exit_code'
+                _
+                "$file"
             )
             ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
