@@ -1621,9 +1621,18 @@ def _write_ninja_file_to_build_library(
     # which means pybind11 related build flags must from torch now
     common_cflags = []
     if is_python_module:
-        import pybind11
+        # Use the pybind11 headers bundled with torch (added to system_includes
+        # from torch/include above) instead of a pip-installed pybind11. This
+        # locks prebuilt kernels and JIT-compiled modules to the same
+        # PYBIND11_INTERNALS_VERSION as torch itself, so a pip pybind11 that
+        # drifts ahead of torch (e.g. 3.1.0 bumping internals v11 -> v12) can no
+        # longer make a JIT module's types incompatible with the prebuilt
+        # aiter_tensor_t. See ROCm/aiter#4770.
+        if torch_exclude:
+            # No torch headers on the include path; fall back to pip pybind11.
+            import pybind11
 
-        extra_include_paths.append(pybind11.get_include())
+            extra_include_paths.append(pybind11.get_include())
         common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
         common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
 
