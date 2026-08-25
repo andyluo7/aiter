@@ -376,6 +376,36 @@ def _calc_diff(x, y):
     return float(1 - 2 * (x * y).sum() / denom)
 
 
+# Accuracy budget, measured on gfx1250 (2 ranks, 1024 tok/rank, 7168x3072, E=384,
+# topk=6, --combine fused --combine_quant mxfp8 -- the worst of the six
+# quant x combine scenarios).
+#
+# _calc_diff is ||x-y||^2 / (||x||^2 + ||y||^2), a SQUARED error, and the per-layer
+# errors accumulate as a random walk: r ~ sqrt(L) makes r^2 ~ L, so the metric grows
+# about linearly in the layer count, then saturates as it approaches the bound.
+# Measured (mxfp8 wire on; it costs a flat +32% on a8w4 and +1.6% on a4w4):
+#
+#             L=1       L=2       L=4       L=8
+#   a4w4   0.021877  0.042683  0.080897  0.144881
+#   a8w4   0.001433  0.002871  0.005742  0.011369
+#
+# slope * L / (1 + sat * L) reproduces both rows within 1%, so scaling that curve
+# keeps the SAME headroom at every layer count. A flat tol cannot: 0.1 rejects a
+# healthy 8-layer a4w4 run (0.145) yet passes anything at all on a8w4.
+_ACC_TOL = {  # quant key -> (per-layer slope, saturation)
+    "a4w4_mxfp4": (0.0225, 0.031),
+    "a8w4_mxfp4": (0.00143, 0.0012),
+}
+_ACC_TOL_FALLBACK = _ACC_TOL["a4w4_mxfp4"]  # unknown key: assume the fp4 budget
+_ACC_TOL_SAFETY = 1.5
+
+
+def default_logits_tol(quant_key, n_layers):
+    # Per-quant tol for an n_layers chain; see _ACC_TOL for the calibration.
+    slope, sat = _ACC_TOL.get(quant_key, _ACC_TOL_FALLBACK)
+    return _ACC_TOL_SAFETY * slope * n_layers / (1.0 + sat * n_layers)
+
+
 # torchrun rendezvous helper
 class Dist:
     def __init__(self):
@@ -925,25 +955,32 @@ def main():
     # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
     accuracy_failure = None
     if args.acc_verify:
+        auto_tol = args.logits_tol is None
+        tol = (
+            default_logits_tol(args.quant_type, n_layers)
+            if auto_tol
+            else args.logits_tol
+        )
+        tol_desc = f"{tol:.6f}{' auto' if auto_tol else ''}"
         out_dev = pipe.final_output().float()
         ref = RefModel(
             w1_bf, w2_bf, sw1, sw2, spec, dev, wire_quant=args.ref_combine_quant
         )
         ref_out = ref.run(x0, routings).float()
         logits_diff = _calc_diff(ref_out, out_dev)
-        errs = dist_ctx.allreduce_sum(0 if logits_diff < args.logits_tol else 1)
+        errs = dist_ctx.allreduce_sum(0 if logits_diff < tol else 1)
         avg_diff = dist_ctx.allreduce_avg_float(logits_diff)
         if dist_ctx.rank == 0:
             print(
                 f"# MEGA-CHECK layers={n_layers}: {'PASS' if errs == 0 else 'FAIL'} "
                 f"(avg logits_diff={avg_diff:.6f} over {dist_ctx.world} ranks, "
-                f"tol={args.logits_tol})",
+                f"tol={tol_desc})",
                 flush=True,
             )
         if errs != 0:
             accuracy_failure = (
                 f"MegaMoE accuracy check failed on {errs}/{dist_ctx.world} ranks: "
-                f"average logits_diff={avg_diff:.6f}, tolerance={args.logits_tol}"
+                f"average logits_diff={avg_diff:.6f}, tolerance={tol_desc}"
             )
 
     pipe.teardown()
@@ -980,7 +1017,11 @@ def _parse_args():
         help="base RNG seed for weights/tokens/routing (optional; default 0)",
     )
     p.add_argument(
-        "--logits_tol", type=float, default=0.1, help="end-to-end 1-cosine tol"
+        "--logits_tol",
+        type=float,
+        default=None,
+        help="end-to-end accuracy tol; default: the per-quant budget for --layers "
+        "(see _ACC_TOL)",
     )
     p.add_argument(
         "--acc_verify", type=int, default=1, help="run fp32 reference accuracy check"
