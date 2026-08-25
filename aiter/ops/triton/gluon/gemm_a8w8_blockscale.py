@@ -991,19 +991,19 @@ def _get_config_cached(
             "Gluon implementation is not supported on this device (requires CDNA4)."
         )
 
-    cfg_dir, prefix = resolve_config_dir(
-        "gemm", "GEMM-A8W8_BLOCKSCALE", backend="gluon", legacy_dir="gemm"
-    )
+    # This family's configs live in the nested layout, so its directory is the
+    # only candidate and the returned name prefix is always empty: nested files
+    # carry no arch prefix and name their default DEFAULT.json.
+    cfg_dir, _ = resolve_config_dir("gemm", "GEMM-A8W8_BLOCKSCALE", backend="gluon")
 
     # Try specialized config first.
     config_dict = load_config_json(
-        f"{cfg_dir}/{prefix}GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json",
+        f"{cfg_dir}/GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json",
         required=False,
     )
     # Fall back to the general config (must exist).
     if config_dict is None:
-        default_stem = "DEFAULT" if prefix == "" else f"{prefix}GEMM-A8W8_BLOCKSCALE"
-        config_dict = load_config_json(f"{cfg_dir}/{default_stem}.json")
+        config_dict = load_config_json(f"{cfg_dir}/DEFAULT.json")
 
     # Config keys should be named M_LEQ_<bound> or "any"
     bounds = []
