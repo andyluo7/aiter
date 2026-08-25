@@ -47,6 +47,21 @@ def check_dir(p: Path) -> Path:
     return p
 
 
+def optional_dir(p: Path) -> Path | None:
+    """
+    Like `check_dir`, but for directories that are allowed to be missing, e.g.
+    legacy layouts that are being migrated away. Returns `None` instead of
+    exiting so that callers can simply contribute no candidates.
+    """
+    if not p.exists():
+        logger.debug("Optional directory [%s] doesn't exist.", p)
+        return None
+    if not p.is_dir():
+        logger.warning("Optional directory [%s] isn't a directory.", p)
+        return None
+    return p
+
+
 @functools.cache
 def root_dir() -> Path:
     return check_dir(Path(__file__).parent.parent.parent)
@@ -63,8 +78,11 @@ def triton_config_dir() -> Path:
 
 
 @functools.cache
-def triton_gemm_config_dir() -> Path:
-    return check_dir(triton_config_dir() / "gemm")
+def triton_gemm_config_dir() -> Path | None:
+    # Legacy flat GEMM config layout. It shrinks and eventually disappears as
+    # config families migrate to `configs/<arch>/<backend>/gemm/<d_type>/`, so
+    # its absence isn't an error: there are simply no legacy files left to match.
+    return optional_dir(triton_config_dir() / "gemm")
 
 
 def list_files(dir: Path, suffix: str = "") -> set[Path]:
@@ -127,7 +145,13 @@ def list_triton_source_files() -> (
 # ------------------------------------------------------------------------------
 
 
-DEVICES: frozenset[str] = frozenset(["gfx942", "gfx950"])
+# Architectures used as the `<arch>-` filename prefix of the legacy flat config
+# layout. In the nested layout the architecture is a directory instead, and it's
+# matched with a wildcard, see `Visitor.add_config_dir`. Keep this in sync with
+# the architecture table in `aiter/ops/triton/configs/CLAUDE.md`.
+DEVICES: frozenset[str] = frozenset(
+    ["gfx942", "gfx950", "gfx1151", "gfx1200", "gfx1201", "gfx1250"]
+)
 
 # Single letter placeholders for JSON config file template strings. You can add
 # more letters if necessary.
@@ -142,6 +166,24 @@ MOE_DTYPES: tuple[str, ...] = (
     "INT4_W4A16",
     "MX_FP4",
 )
+
+
+def fold_config_name(config_name: str) -> str:
+    """
+    Folds a config name into the `<d_type>` directory name of the nested config
+    layout, the same way `gemm_config_utils._dtype_dir()` does it, e.g.
+    `GEMM-AFP4WFP4` becomes `gemm_afp4wfp4`.
+
+    :param config_name: Config family name, e.g. `GEMM-AFP4WFP4`. May contain
+                        `{...}` interpolation placeholders, which are left
+                        untouched so that later expansion steps still recognize
+                        them.
+    :return: Directory name of the config family in the nested config layout.
+    """
+    return "".join(
+        part if part.startswith("{") else part.lower().replace("-", "_")
+        for part in re.split(r"(\{[^{}]*\})", config_name)
+    )
 
 
 def expand_mnk(json_string: str, config_files: list[Path]) -> list[str]:
@@ -182,15 +224,50 @@ def expand_mnk(json_string: str, config_files: list[Path]) -> list[str]:
     return [f'f"{path}"' for c in config_files if pattern.match(path := c.as_posix())]
 
 
+def expand_globs(json_string: str, config_files: list[Path]) -> list[str]:
+    """
+    Expands template strings containing `*` wildcards by matching them against
+    actual config file paths. Like a shell glob, a wildcard matches anything
+    within a single path component.
+
+    :param json_string: Template string that references kernel config JSON files.
+                        May contain `*` wildcards to be expanded.
+    :param config_files: All Triton kernel config JSON files available in the
+                         filesystem.
+    :return: List of template strings with expanded wildcards or a list
+             containing just the input template string as-is if there are no
+             wildcards to be expanded.
+    """
+    # Early exit if no wildcards present.
+    if "*" not in json_string:
+        logger.debug("No wildcards in [%s].", json_string)
+        return [json_string]
+    # Strip `f"` prefix and `"` suffix, escape special regex characters, then turn
+    # every escaped wildcard into a group matching a single path component. For
+    # example, `f"configs/*/*/moe/a8w4/*.json"` becomes
+    # `configs/[^/]*/[^/]*/moe/a8w4/[^/]*\.json`.
+    pattern_str = re.escape(json_string[2:-1]).replace(re.escape("*"), "[^/]*")
+    # Compile regex with anchors to match entire path.
+    pattern = re.compile(f"^{pattern_str}$")
+    logger.debug("Wildcard regex is [%s].", pattern.pattern)
+    # Return f-string representations of matching config paths.
+    return [f'f"{path}"' for c in config_files if pattern.match(path := c.as_posix())]
+
+
 def expand_moe_dtypes(json_strings: list[str]) -> list[str]:
     expanded_moe_dtypes: list[str] = []
     for s in json_strings:
+        # Legacy flat file names keep the config name verbatim, e.g.
+        # `gfx950-MOE-FP8_W8A8.json`, while the `<d_type>` directory of the nested
+        # layout folds it with `fold_config_name`, e.g. `moe_fp8_w8a8`.
         if r"MOE-{dtype_str}" in s:
-            expanded_moe_dtypes.extend(
-                s.replace(r"{dtype_str}", dtype) for dtype in MOE_DTYPES
-            )
+            dtypes = MOE_DTYPES
+        elif r"moe_{dtype_str}" in s:
+            dtypes = tuple(dtype.lower() for dtype in MOE_DTYPES)
         else:
             expanded_moe_dtypes.append(s)
+            continue
+        expanded_moe_dtypes.extend(s.replace(r"{dtype_str}", dtype) for dtype in dtypes)
     return expanded_moe_dtypes
 
 
@@ -215,6 +292,12 @@ def expand_interpolations(json_string: str, config_files: list[Path]) -> list[st
     ]
     # Expand MOE data type variants
     expanded = expand_moe_dtypes(expanded)
+    # Expand nested config layout wildcards
+    expanded = [
+        expanded_glob
+        for s in expanded
+        for expanded_glob in expand_globs(s, config_files)
+    ]
     # Clean up f-string delimiters if no more interpolation needed
     expanded = [s[2:-1] if not any(c in s for c in "{}") else s for s in expanded]
     return expanded
@@ -264,11 +347,17 @@ def resolve_json_strings(
 
 
 def resolve_gemm_config_names(gemm_config_names: list[str]) -> list[Path]:
+    # Legacy flat layout only. Config families that already moved to the nested
+    # layout are matched from their `resolve_config_dir` call sites instead, see
+    # `Visitor.add_config_dir`.
+    gemm_config_dir = triton_gemm_config_dir()
+    if not gemm_config_names or gemm_config_dir is None:
+        return []
     gemm_configs = [
         p.relative_to(root_dir())
         for dev in DEVICES
         for gemm_config_name in gemm_config_names
-        for p in triton_gemm_config_dir().glob(f"{dev}-{gemm_config_name}*.json")
+        for p in gemm_config_dir.glob(f"{dev}-{gemm_config_name}*.json")
         if p.is_file()
     ]
     if gemm_configs:
@@ -364,6 +453,34 @@ def get_filename_diff(source_branch: str | None, target_branch: str) -> set[Path
 
 # Source file parsing.
 # ------------------------------------------------------------------------------
+
+
+def join_fstring(node: ast.JoinedStr) -> str:
+    """
+    Flattens an f-string AST node into a plain string, keeping every
+    interpolation as a `{expr}` placeholder for later expansion.
+    """
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(value.value)
+        elif isinstance(value, ast.FormattedValue):
+            # Unparse the inner expression to a readable form.
+            parts.append(f"{{{ast.unparse(value.value)}}}")
+    return "".join(parts)
+
+
+def literal_str(node: ast.expr) -> str | None:
+    """
+    Extracts the value of a string literal AST node: plain strings verbatim,
+    f-strings with their interpolations kept as `{expr}` placeholders. Returns
+    `None` for anything that isn't a string literal.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return join_fstring(node)
+    return None
 
 
 class Visitor(ast.NodeVisitor):
@@ -478,6 +595,28 @@ class Visitor(ast.NodeVisitor):
             return
         self.json_strings.add(json_string)
 
+    def add_config_dir(self, op: str, config_name: str) -> None:
+        """
+        Records the config directory that a `resolve_config_dir(op, config_name)`
+        call site resolves to in the nested config layout,
+        `configs/<arch>/<backend>/<op>/<d_type>/`, as a wildcard template.
+
+        Loaders read `DEFAULT.json` and the specialized files of the family from
+        that directory through `f"{cfg_dir}/..."` strings, which can't be resolved
+        on their own. Matching the whole directory instead keeps the edge from
+        every config file of the family to the code that reads it.
+        """
+        if not op or not config_name:
+            return
+        # Architecture and backend are directories here, so they're wildcards: all
+        # of a family's config files feed the same modules regardless of which
+        # architecture or backend they were tuned for.
+        config_dir_glob = (
+            r"{AITER_TRITON_CONFIGS_PATH}"
+            f"/*/*/{op}/{fold_config_name(config_name)}/*.json"
+        )
+        self.add_json_string(f"f{config_dir_glob!r}")
+
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             self.add_dependency(alias.name)
@@ -508,32 +647,33 @@ class Visitor(ast.NodeVisitor):
 
     def visit_JoinedStr(self, node: ast.JoinedStr) -> None:
         # f-strings.
-        parts = []
-        for value in node.values:
-            if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                parts.append(value.value)
-            elif isinstance(value, ast.FormattedValue):
-                # Unparse the inner expression to a readable form.
-                expr_str = ast.unparse(value.value)
-                parts.append(f"{{{expr_str}}}")
-        joined = "".join(parts)
+        joined = join_fstring(node)
         if joined.lower().endswith(".json"):
             self.add_json_string(f"f{joined!r}")
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
-        is_get_gemm_config = (
-            isinstance(func, ast.Name)
-            and func.id == "get_gemm_config"
-            or isinstance(func, ast.Attribute)
-            and func.attr == "get_gemm_config"
-        )
-        if is_get_gemm_config and node.args:
-            gemm_config_name = node.args[0]
-            if isinstance(gemm_config_name, ast.Constant) and isinstance(
-                gemm_config_name.value, str
-            ):
-                self.gemm_config_names.add(gemm_config_name.value)
+        func_name = ""
+        if isinstance(func, ast.Name):
+            func_name = func.id
+        elif isinstance(func, ast.Attribute):
+            func_name = func.attr
+        # `get_gemm_config(config_name, ...)` finds its config directory through
+        # `resolve_config_dir("gemm", config_name, ...)`; direct call sites of the
+        # shared probe name the operation themselves.
+        op: str | None = None
+        config_name: str | None = None
+        if func_name == "get_gemm_config" and node.args:
+            op, config_name = "gemm", literal_str(node.args[0])
+        elif func_name == "resolve_config_dir" and len(node.args) > 1:
+            op, config_name = literal_str(node.args[0]), literal_str(node.args[1])
+        if op and config_name:
+            # Nested layout, `configs/<arch>/<backend>/<op>/<d_type>/*.json`.
+            self.add_config_dir(op, config_name)
+            if op == "gemm":
+                # Legacy flat layout, `configs/gemm/<arch>-<CONFIG_NAME>*.json`,
+                # still holds every family that hasn't been migrated yet.
+                self.gemm_config_names.add(config_name)
         self.generic_visit(node)
 
 
