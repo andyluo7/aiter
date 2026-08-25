@@ -9,18 +9,19 @@ Out of scope, do not touch without an explicit request: `configs/conv/`,
 `configs/hstu_attn/`, and the flat attention / GMM / MHC / MLA files at the top
 of `configs/`. They have their own loaders and are unaffected by anything here.
 
-The tree is **mid-migration** from a flat, arch-prefixed layout to a nested
-`<arch>/<backend>/<op>/<d_type>/` layout. Both layouts are live, but **the legacy flat
-layout is deprecated and will be removed** — treat it as read-only history, not
-as a place to add things.
+Every GEMM family now lives in the nested `<arch>/<backend>/<op>/<d_type>/`
+layout, and the flat, arch-prefixed fallback has been removed from
+`get_gemm_config()` — a GEMM config outside the nested layout no longer
+resolves. **MOE is still flat** (`configs/moe/`, arch-prefixed) and stays that
+way until `get_moe_config()` lands; see §5.
 
 Two non-negotiables:
 
 1. **Tuning values live in JSON, never in Python.** No `setdefault`, no inline
    dict literals, no arch-conditional constants, no hardcoded fallback configs.
    If a value is missing, fix the JSON.
-2. **New configs go in the target layout** unless their family is still in the
-   legacy directory (see §6).
+2. **New GEMM configs go in the nested layout.** It is the only layout
+   `get_gemm_config()` reads. MOE is the exception (§5).
 
 `GEMM-AFP4WFP4` (gfx950 triton, gfx950/gfx1250 gluon) and
 `GEMM-AFP4WFP4_PRESHUFFLED` (gfx950/gfx1250 triton) are the migrated
@@ -88,29 +89,27 @@ from that same directory.
 
 1. `configs/<arch>/triton/gemm/<d_type>/DEFAULT.json`
 2. `configs/<arch>/gluon/gemm/<d_type>/DEFAULT.json`
-3. `configs/gemm/<arch>-<CONFIG_NAME>.json`  *(legacy)*
 
 **`backend="triton"|"gluon"`**:
 
 1. `configs/<arch>/<backend>/gemm/<d_type>/DEFAULT.json`
-2. `configs/gemm/<backend>/<arch>-<CONFIG_NAME>.json`  *(legacy)*
-3. `configs/gemm/<arch>-<CONFIG_NAME>.json`  *(legacy)*
 
-If nothing matches, the last legacy candidate is used and the missing-default
-assertion fires there — so error messages still point at `configs/gemm/`.
+If nothing matches, the last candidate is used and the missing-default
+assertion fires there, naming the nested path the file should have had.
 
-The legacy candidates are marked `# TODO(satya): legacy, remove` and are
-scheduled for deletion. Do not write new code that depends on them resolving.
+`resolve_config_dir()` still accepts `legacy_dir` — unused by GEMM, kept for
+the MOE unification described in §5.
 
 Consequences to keep in mind:
 
 - **A directory is chosen as a unit.** The unit is the family's `<d_type>/`
-  directory. Splitting a config family across `<arch>/triton/gemm/<d_type>/`
-  and legacy `configs/gemm/` silently drops the specialized files in whichever
-  directory loses the probe. Move a family wholesale or not at all. Worse: a
+  directory. Splitting a family across two candidate directories silently
+  drops the specialized files in whichever one loses the probe — in particular,
+  adding a `DEFAULT.json` for a family whose specialized files live elsewhere
+  hides them. Move a family wholesale or not at all. Worse: a
   `<d_type>/` directory with specialized files but **no `DEFAULT.json` is
-  invisible** — the probe keys only on `DEFAULT.json` and falls through to
-  legacy, ignoring everything in the directory.
+  invisible** — the probe keys only on `DEFAULT.json`, so it falls through to
+  the next candidate and ignores everything in the directory.
 - **`backend=None` prefers `triton` over `gluon`.** On an arch with only a
   gluon default (currently gfx1250 `GEMM-AFP4WFP4`), lookup falls through to
   gluon. Adding `configs/gfx1250/triton/gemm/gemm_afp4wfp4/DEFAULT.json` later
@@ -124,10 +123,11 @@ Consequences to keep in mind:
 
 Direct-path loaders bypass the resolver's directory probe. Grep for
 `f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything —
-`gluon/gemm_a8w8_blockscale.py` still builds legacy `gemm/gluon/` paths by
-hand (via `load_config_json`) and must be edited when its configs move.
+`gluon/gemm_a8w8_blockscale.py` needs the whole config dict for its tile
+filtering, so it calls `resolve_config_dir()` directly instead of
+`get_gemm_config()` — it is on the shared probe and needs no path edits.
 `gluon/gemm_a8w8.py` and `gluon/gemm_afp4wfp4.py` go through
-`get_gemm_config(backend="gluon")` and need no changes.
+`get_gemm_config(backend="gluon")`.
 
 ---
 
@@ -359,9 +359,9 @@ legacy form if a step is ambiguous.
    migrated family must be fully described by its config files.
 7. **Verify** on the target arch: config resolves, `is_tuned` is `True` for a
    shape that has a specialized file, and numerics are unchanged.
-8. Leave the `# TODO(satya): legacy, remove` markers in `gemm_config_utils.py`
-   until `configs/gemm/` is empty. Deleting the legacy fallback is the final
-   step of the migration, not an intermediate one.
+8. The GEMM legacy fallback is gone: `get_gemm_config()` reads the nested
+   layout only, so a family that is not fully moved stops resolving. There is
+   no fallback left to lean on mid-migration.
 
 ### Adding a *new* tuned config (no migration)
 

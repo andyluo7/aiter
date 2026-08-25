@@ -54,8 +54,9 @@ import from the categorized path** (`aiter.ops.triton.gemm.basic.gemm_a16w16`).
 
 ### Two layouts are live; only one accepts new files
 
-The config tree is mid-migration from a flat, arch-prefixed layout to a nested
-one. The legacy flat layout is **deprecated — treat it as read-only history**:
+GEMM configs live in the nested layout below; the flat, arch-prefixed fallback
+has been removed from the resolver. MOE is still flat until `get_moe_config()`
+lands:
 
 ```text
 # Target layout (all new GEMM configs go here)
@@ -64,8 +65,7 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 #        gfx950   triton    gemm  gemm_afp4wfp4
 #                 gluon     moe
 
-# Legacy layout (deprecated, pending removal)
-configs/gemm/<arch>-<CONFIG_NAME>[-<suffix>].json
+# MOE only (no nested resolver yet)
 configs/moe/<arch>-MOE-<dtype_str>.json
 ```
 
@@ -96,8 +96,8 @@ All GEMM-family kernels load configs through one function,
 `utils/gemm_config_utils.py::get_gemm_config(config_name, M, N=None, K=None,
 bounds=None, specialized_filename=None, backend=None, B=None)`. It probes
 candidate directories for the default file and takes the first hit
-(`backend=None` → `<arch>/triton/gemm/` → `<arch>/gluon/gemm/` → legacy
-`configs/gemm/`), then reads specialized files from that same directory.
+(`backend=None` → `<arch>/triton/gemm/` → `<arch>/gluon/gemm/`), then reads
+specialized files from that same directory.
 It returns `(config, is_tuned)`:
 
 - the config is a fresh deep copy, safe to mutate;
