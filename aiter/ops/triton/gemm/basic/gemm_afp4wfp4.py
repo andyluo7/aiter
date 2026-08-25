@@ -29,6 +29,8 @@ _LOGGER = AiterTritonLogger()
 
 _USE_GEMM_SPLITK_BF16 = False
 
+_GLUON_SUPPORTED_ARCHS = ("gfx950",)
+
 
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
@@ -257,6 +259,133 @@ def gemm_afp4wfp4_(
     return y
 
 
+def _gemm_afp4wfp4_gluon(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: torch.dtype | None,
+    y: torch.Tensor | None,
+    config: dict | None,
+    skip_reduce: bool | None,
+) -> torch.Tensor:
+    arch = arch_info.get_arch()
+    assert (
+        arch in _GLUON_SUPPORTED_ARCHS
+    ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'"
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4 import (
+        _gemm_afp4wfp4_kernel as _gluon_gemm_afp4wfp4_kernel,
+    )
+
+    _LOGGER.info(
+        f"GEMM_AFP4WFP4 [gluon/{arch}]: x={tuple(x.shape)} w={tuple(w.shape)} "
+        f"x_scales={tuple(x_scales.shape)} w_scales={tuple(w_scales.shape)}"
+    )
+
+    M, K = x.shape
+    N, K = w.shape
+
+    w = w.T
+
+    if config is None:
+        config, _ = _get_config(M, N, K, backend="gluon")
+
+    # The gluon kernel derives its own split-K blocking; it does not use
+    # get_splitk, whose BLOCK_SIZE_K shrinking is tuned for the triton kernel.
+    if config["BLOCK_SIZE_K"] >= K * 2:
+        config["NUM_KSPLIT"] = 1
+
+    if config["NUM_KSPLIT"] > 1:
+        config["SPLITK_BLOCK_SIZE"] = (
+            triton.cdiv(
+                2 * triton.cdiv(K, config["NUM_KSPLIT"]), config["BLOCK_SIZE_K"]
+            )
+            * config["BLOCK_SIZE_K"]
+        )
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
+    if config["NUM_KSPLIT"] > 1:
+        y_pp = torch.empty(
+            (config["NUM_KSPLIT"], M, N),
+            dtype=dtype if _USE_GEMM_SPLITK_BF16 else torch.float32,
+            device=x.device,
+        )
+    else:
+        y_pp = None
+
+    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+    grid = lambda META: (
+        (
+            META["NUM_KSPLIT"]
+            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+        ),
+    )
+
+    _gluon_gemm_afp4wfp4_kernel[grid](
+        x,
+        w,
+        y if config["NUM_KSPLIT"] == 1 else y_pp,
+        x_scales,
+        w_scales,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        x_scales.stride(0),
+        x_scales.stride(1),
+        w_scales.stride(0),
+        w_scales.stride(1),
+        **config,
+    )
+
+    if config["NUM_KSPLIT"] > 1:
+        if skip_reduce:
+            return y_pp
+
+        REDUCE_BLOCK_SIZE_M = 16
+        REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
+        ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
+
+        grid_reduce = (
+            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
+            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+        )
+        _gemm_splitk_reduce_kernel[grid_reduce](
+            y_pp,
+            y,
+            None,
+            M,
+            N,
+            y_pp.stride(0),
+            y_pp.stride(1),
+            y_pp.stride(2),
+            y.stride(0),
+            y.stride(1),
+            REDUCE_BLOCK_SIZE_M,
+            REDUCE_BLOCK_SIZE_N,
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation="",
+            use_activation=False,
+            KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
+        )
+
+    return y
+
+
 def gemm_afp4wfp4(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -266,9 +395,19 @@ def gemm_afp4wfp4(
     y: torch.Tensor | None = None,
     config: dict | None = None,
     skip_reduce: bool | None = False,
+    backend: str = "triton",
 ) -> torch.Tensor:
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if backend == "gluon":
+        return _gemm_afp4wfp4_gluon(
+            x, w, x_scales, w_scales, dtype, y, config, skip_reduce
+        )
+
     if config is None:
-        config_hashable = None
         M, K = x.shape
         N, _ = w.shape
         config, _ = _get_config(M, N, K)
