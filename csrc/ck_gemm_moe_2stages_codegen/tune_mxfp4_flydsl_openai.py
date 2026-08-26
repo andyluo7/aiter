@@ -34,7 +34,20 @@ if __package__ in (None, "") and str(_REPO_ROOT) not in sys.path:
 
 import torch
 
-from aiter.ops.flydsl.mxfp4_gemm1_kernels import _effective_use_nt
+try:  # pragma: no cover - depends on which GEMM1 launcher this tree ships
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import _effective_use_nt
+except ImportError:  # launcher without the BM32 streaming-load override
+
+    def _effective_use_nt(*, n_tokens, topk, NE, BM, use_nt, inline_quant):
+        """Identity fallback.
+
+        This only describes what the runtime will actually do with the
+        candidate's ``use_nt``. A launcher that does not override it is
+        described correctly by returning it unchanged.
+        """
+        return use_nt
+
+
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
