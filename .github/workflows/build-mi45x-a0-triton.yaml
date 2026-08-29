@@ -7,10 +7,10 @@ permissions:
   contents: write
 
 env:
-  TRITON_BASE_COMMIT: 5d6048aa0a324e090ada215b609ea76620133845
+  TRITON_BASE_COMMIT: e411a7fddbb7ccb2c082d44d7ec48dcd687c0645
   TRITON_REV0_FLAG_COMMIT: 6020f4f2767c2c47e1fbb9704efec56f9619471e
   TRITON_WMMA_COMMIT: b45434c0b75749602194ca9f1280170337ef24c2
-  TRITON_RELEASE_TAG: temporary-triton-5d6048aa-gfx1250-a0
+  TRITON_RELEASE_TAG: temporary-triton-e411a7fd-gfx1250-a0
 
 jobs:
   build:
@@ -47,16 +47,18 @@ jobs:
             "refs/heads/shared/gfx1250_rev3:refs/remotes/origin/shared/gfx1250_rev3"
           git -C triton-a0 checkout --detach "${TRITON_BASE_COMMIT}"
 
-          for patch_commit in \
+          git -C triton-a0 show --format= --binary \
             "${TRITON_REV0_FLAG_COMMIT}" \
-            "${TRITON_WMMA_COMMIT}"; do
-            git -C triton-a0 show --format= --binary "${patch_commit}" \
-              | git -C triton-a0 apply --index
-          done
+            -- third_party/amd/backend/compiler.py \
+            | git -C triton-a0 apply --index
+          git -C triton-a0 show --format= --binary \
+            "${TRITON_WMMA_COMMIT}" \
+            -- third_party/amd/lib/TritonAMDGPUTransforms/WmmaGroup.cpp \
+            | git -C triton-a0 apply --index
 
           git -C triton-a0 diff --cached --check
           git -C triton-a0 diff --cached --binary \
-            > triton-5d6048aa-gfx1250-a0.patch
+            > triton-e411a7fd-gfx1250-a0.patch
 
           grep -Fq -- "-amdgpu-gfx1250-b0-specific=0" \
             triton-a0/third_party/amd/backend/compiler.py
@@ -122,7 +124,7 @@ jobs:
           import pathlib
           import triton
 
-          expected = "3.7.1+git5d6048aa.gfx1250a0"
+          expected = "3.8.0+gite411a7fd.gfx1250a0"
           if triton.__version__ != expected:
               raise SystemExit(
                   f"unexpected Triton version: {triton.__version__!r}, expected {expected!r}"
@@ -175,7 +177,7 @@ jobs:
 
           notes = f"""Private diagnostic wheel for the MI45X/gfx1250 A0 compiler A/B.
 
-          - Triton base: `{provenance['base_commit']}` (the exact compiler used by full run 33214583869)
+          - Triton base: `{provenance['base_commit']}` (the AITER-pinned compiler)
           - Revision-0 LLVM flag source: `{provenance['revision_zero_flag_commit']}`
           - 128-wide FP8/BF8 WMMA disable source: `{provenance['disable_128_wmma_commit']}`
           - Wheel: `{provenance['wheel']}`
@@ -190,11 +192,11 @@ jobs:
 
           gh release create "${TRITON_RELEASE_TAG}" \
             "${TRITON_WHEEL}" \
-            triton-5d6048aa-gfx1250-a0.patch \
+            triton-e411a7fd-gfx1250-a0.patch \
             triton-a0-provenance.json \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
-            --title "Temporary Triton 5d6048aa build for gfx1250 A0 CI" \
+            --title "Temporary Triton e411a7fd build for gfx1250 A0 CI" \
             --notes-file triton-a0-release-notes.md
 
       - name: Add build result to summary
