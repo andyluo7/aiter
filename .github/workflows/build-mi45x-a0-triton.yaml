@@ -7,16 +7,43 @@ permissions:
   contents: write
 
 env:
-  TRITON_BASE_COMMIT: e411a7fddbb7ccb2c082d44d7ec48dcd687c0645
   TRITON_REV0_FLAG_COMMIT: 6020f4f2767c2c47e1fbb9704efec56f9619471e
   TRITON_WMMA_COMMIT: b45434c0b75749602194ca9f1280170337ef24c2
-  TRITON_RELEASE_TAG: temporary-triton-e411a7fd-gfx1250-a0
 
 jobs:
   build:
-    name: Build CPython 3.12 revision-0 wheel
+    name: Build CPython 3.12 revision-0 wheel (${{ matrix.variant }})
     runs-on: ubuntu-22.04
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline-5d6048aa
+            base_commit: 5d6048aa0a324e090ada215b609ea76620133845
+            expected_version: 3.7.1+git5d6048aa.gfx1250a0
+            patch_file: .github/patches/triton-5d6048aa-gfx1250-a0.patch
+            patch_asset: triton-5d6048aa-gfx1250-a0.patch
+            release_tag: temporary-triton-5d6048aa-gfx1250-a0
+            release_title: Temporary Triton 5d6048aa build for gfx1250 A0 CI
+            base_description: exact compiler source used by full run 33214583869
+          - variant: aiter-pinned-e411a7fd
+            base_commit: e411a7fddbb7ccb2c082d44d7ec48dcd687c0645
+            expected_version: 3.8.0+gite411a7fd.gfx1250a0
+            patch_file: .github/patches/triton-e411a7fd-gfx1250-a0.patch
+            patch_asset: triton-e411a7fd-gfx1250-a0.patch
+            release_tag: temporary-triton-e411a7fd-gfx1250-a0
+            release_title: Temporary Triton e411a7fd build for gfx1250 A0 CI
+            base_description: AITER-pinned compiler source
+    env:
+      TRITON_BASE_COMMIT: ${{ matrix.base_commit }}
+      TRITON_BASE_DESCRIPTION: ${{ matrix.base_description }}
+      TRITON_EXPECTED_VERSION: ${{ matrix.expected_version }}
+      TRITON_PATCH_ASSET: ${{ matrix.patch_asset }}
+      TRITON_PATCH_FILE: ${{ matrix.patch_file }}
+      TRITON_RELEASE_TAG: ${{ matrix.release_tag }}
+      TRITON_RELEASE_TITLE: ${{ matrix.release_title }}
+      TRITON_VARIANT: ${{ matrix.variant }}
 
     steps:
       - name: Checkout CI repository
@@ -42,17 +69,15 @@ jobs:
 
           git clone --filter=blob:none --no-checkout \
             https://github.com/ROCm/triton.git triton-a0
-          git -C triton-a0 fetch --no-tags origin \
-            "${TRITON_BASE_COMMIT}" \
-            "refs/heads/shared/gfx1250_rev3:refs/remotes/origin/shared/gfx1250_rev3"
+          git -C triton-a0 fetch --no-tags origin "${TRITON_BASE_COMMIT}"
           git -C triton-a0 checkout --detach "${TRITON_BASE_COMMIT}"
 
           git -C triton-a0 apply --index \
-            "${GITHUB_WORKSPACE}/.github/patches/triton-e411a7fd-gfx1250-a0.patch"
+            "${GITHUB_WORKSPACE}/${TRITON_PATCH_FILE}"
 
           git -C triton-a0 diff --cached --check
           git -C triton-a0 diff --cached --binary \
-            > triton-e411a7fd-gfx1250-a0.patch
+            > "${TRITON_PATCH_ASSET}"
 
           grep -Fq -- "-amdgpu-gfx1250-b0-specific=0" \
             triton-a0/third_party/amd/backend/compiler.py
@@ -115,13 +140,16 @@ jobs:
             --target "${check_dir}" \
             "${TRITON_WHEEL}"
           PYTHONPATH="${check_dir}" python3 - <<'PY'
+          import importlib.metadata
+          import os
           import pathlib
           import triton
 
-          expected = "3.8.0+gite411a7fd.gfx1250a0"
-          if triton.__version__ != expected:
+          expected = os.environ["TRITON_EXPECTED_VERSION"]
+          installed = importlib.metadata.version("triton")
+          if installed != expected:
               raise SystemExit(
-                  f"unexpected Triton version: {triton.__version__!r}, expected {expected!r}"
+                  f"unexpected Triton distribution version: {installed!r}, expected {expected!r}"
               )
 
           compiler = (
@@ -132,7 +160,8 @@ jobs:
           ).read_text(encoding="utf-8")
           if "-amdgpu-gfx1250-b0-specific=0" not in compiler:
               raise SystemExit("installed wheel is missing the gfx1250 revision-0 flag")
-          print(f"triton={triton.__version__}")
+          print(f"triton_distribution={installed}")
+          print(f"triton_module_version={triton.__version__}")
           print(f"module={triton.__file__}")
           PY
 
@@ -155,7 +184,9 @@ jobs:
           from pathlib import Path
 
           provenance = {
+              "variant": os.environ["TRITON_VARIANT"],
               "base_commit": os.environ["TRITON_BASE_COMMIT"],
+              "base_description": os.environ["TRITON_BASE_DESCRIPTION"],
               "revision_zero_flag_commit": os.environ["TRITON_REV0_FLAG_COMMIT"],
               "disable_128_wmma_commit": os.environ["TRITON_WMMA_COMMIT"],
               "wheel": os.environ["TRITON_WHEEL_NAME"],
@@ -171,7 +202,7 @@ jobs:
 
           notes = f"""Private diagnostic wheel for the MI45X/gfx1250 A0 compiler A/B.
 
-          - Triton base: `{provenance['base_commit']}` (the AITER-pinned compiler)
+          - Triton base: `{provenance['base_commit']}` ({provenance['base_description']})
           - Revision-0 LLVM flag source: `{provenance['revision_zero_flag_commit']}`
           - 128-wide FP8/BF8 WMMA disable source: `{provenance['disable_128_wmma_commit']}`
           - Wheel: `{provenance['wheel']}`
@@ -186,11 +217,11 @@ jobs:
 
           gh release create "${TRITON_RELEASE_TAG}" \
             "${TRITON_WHEEL}" \
-            triton-e411a7fd-gfx1250-a0.patch \
+            "${TRITON_PATCH_ASSET}" \
             triton-a0-provenance.json \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
-            --title "Temporary Triton e411a7fd build for gfx1250 A0 CI" \
+            --title "${TRITON_RELEASE_TITLE}" \
             --notes-file triton-a0-release-notes.md
 
       - name: Add build result to summary
@@ -200,6 +231,7 @@ jobs:
           {
             echo "## MI45X A0 Triton compiler"
             echo
+            echo "- Variant: ${TRITON_VARIANT}"
             echo "- Base: ${TRITON_BASE_COMMIT}"
             echo "- Revision-0 flag: ${TRITON_REV0_FLAG_COMMIT}"
             echo "- Disable 128-wide FP8/BF8 WMMA: ${TRITON_WMMA_COMMIT}"
