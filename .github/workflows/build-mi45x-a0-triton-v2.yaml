@@ -1,0 +1,184 @@
+name: Build MI45X A0 Triton v2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TRITON_BASE_COMMIT: e411a7fddbb7ccb2c082d44d7ec48dcd687c0645
+  TRITON_BASE_DESCRIPTION: AITER-pinned compiler source
+  TRITON_EXPECTED_VERSION: 3.8.0+gite411a7fd.gfx1250a0v2
+  TRITON_MULTICAST_COMMIT: 7a11e72a9ef9c45f1465109a6080f2916b0cb0f0
+  TRITON_PATCH_ASSET: triton-e411a7fd-gfx1250-a0v2.patch
+  TRITON_PATCH_FILE: .github/patches/triton-e411a7fd-gfx1250-a0v2.patch
+  TRITON_RELEASE_TAG: temporary-triton-e411a7fd-gfx1250-a0v2
+  TRITON_RELEASE_TITLE: Temporary Triton e411a7fd build for gfx1250 A0 v2 CI
+
+jobs:
+  build:
+    name: Build CPython 3.12 revision-0 v2 wheel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out public source repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld
+          python3 -m pip install --upgrade pip
+
+      - name: Prepare exact revision-0 Triton source
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/ROCm/triton.git triton-a0
+          git -C triton-a0 fetch --no-tags origin "${TRITON_BASE_COMMIT}"
+          git -C triton-a0 checkout --detach "${TRITON_BASE_COMMIT}"
+
+          git -C triton-a0 apply --unidiff-zero --index \
+            "${GITHUB_WORKSPACE}/${TRITON_PATCH_FILE}"
+          git -C triton-a0 diff --cached --check
+          git -C triton-a0 diff --cached --binary > "${TRITON_PATCH_ASSET}"
+
+          grep -Fq -- "-amdgpu-gfx1250-b0-specific=0" \
+            triton-a0/third_party/amd/backend/compiler.py
+          grep -Fq -- "force the lowering to use the unicast path" \
+            triton-a0/third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp
+          if grep -Fq \
+            'TRITON_WMMA_v_2case(3, 16, 16, ocpFp8T, ocpFp8T' \
+            triton-a0/third_party/amd/lib/TritonAMDGPUTransforms/WmmaGroup.cpp; then
+            echo "128-wide FP8 WMMA remains enabled" >&2
+            exit 1
+          fi
+
+      - name: Build wheel
+        env:
+          MAX_JOBS: "2"
+          TRITON_BUILD_WITH_CLANG_LLD: "1"
+          TRITON_WHEEL_VERSION_SUFFIX: "+gfx1250a0v2"
+        run: |
+          set -euo pipefail
+          python3 -m pip install -r triton-a0/python/requirements.txt
+          mkdir -p wheelhouse
+          python3 -m pip wheel \
+            --no-build-isolation \
+            --no-deps \
+            ./triton-a0 \
+            --wheel-dir wheelhouse
+
+          mapfile -t wheels < <(find wheelhouse -maxdepth 1 -type f -name 'triton-*.whl' -print)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            printf 'expected one wheel, found %s\n' "${#wheels[@]}" >&2
+            exit 1
+          fi
+          wheel="${wheels[0]}"
+          {
+            echo "TRITON_WHEEL=${wheel}"
+            echo "TRITON_WHEEL_NAME=$(basename "${wheel}")"
+            echo "TRITON_WHEEL_SHA256=$(sha256sum "${wheel}" | awk '{print $1}')"
+            echo "TRITON_WHEEL_BYTES=$(stat -c '%s' "${wheel}")"
+          } >> "${GITHUB_ENV}"
+
+      - name: Verify wheel provenance and import
+        run: |
+          set -euo pipefail
+          check_dir="${RUNNER_TEMP}/triton-a0v2-check"
+          python3 -m pip install --no-deps --target "${check_dir}" "${TRITON_WHEEL}"
+          PYTHONPATH="${check_dir}" python3 - <<'PY'
+          import importlib.metadata
+          import os
+          import pathlib
+          import triton
+
+          expected = os.environ["TRITON_EXPECTED_VERSION"]
+          installed = importlib.metadata.version("triton")
+          if installed != expected:
+              raise SystemExit(f"unexpected Triton version: {installed!r}, expected {expected!r}")
+          compiler = pathlib.Path(triton.__file__).parent / "backends" / "amd" / "compiler.py"
+          if "-amdgpu-gfx1250-b0-specific=0" not in compiler.read_text(encoding="utf-8"):
+              raise SystemExit("installed wheel is missing the gfx1250 revision-0 flag")
+          print(f"triton_distribution={installed}")
+          print(f"triton_module_version={triton.__version__}")
+          PY
+
+      - name: Publish temporary public release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TRITON_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "release ${TRITON_RELEASE_TAG} already exists; refusing to overwrite" >&2
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          provenance = {
+              "variant": "aiter-pinned-e411a7fd-gfx1250-a0v2",
+              "base_commit": os.environ["TRITON_BASE_COMMIT"],
+              "base_description": os.environ["TRITON_BASE_DESCRIPTION"],
+              "revision_zero_flag_commit": "6020f4f2767c2c47e1fbb9704efec56f9619471e",
+              "disable_128_wmma_commit": "b45434c0b75749602194ca9f1280170337ef24c2",
+              "disable_multicast_reference_commit": os.environ["TRITON_MULTICAST_COMMIT"],
+              "wheel": os.environ["TRITON_WHEEL_NAME"],
+              "wheel_sha256": os.environ["TRITON_WHEEL_SHA256"],
+              "wheel_bytes": int(os.environ["TRITON_WHEEL_BYTES"]),
+              "python": "CPython 3.12",
+              "platform": "linux_x86_64",
+          }
+          Path("triton-a0v2-provenance.json").write_text(
+              json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          notes = f"""Temporary public-source-only build for the MI45X/gfx1250 A0 compiler A/B.
+
+          - Triton base: `{provenance['base_commit']}`
+          - Revision-zero LLVM flag: `{provenance['revision_zero_flag_commit']}`
+          - K=128 FP8/BF8 WMMA disable: `{provenance['disable_128_wmma_commit']}`
+          - CTA multicast-mask disable reference: `{provenance['disable_multicast_reference_commit']}`
+          - Wheel: `{provenance['wheel']}`
+          - Wheel SHA-256: `{provenance['wheel_sha256']}`
+
+          This release will be removed after verified transfer to the private MI45X CI repository.
+          """
+          Path("triton-a0v2-release-notes.md").write_text(notes, encoding="utf-8")
+          PY
+
+          gh release create "${TRITON_RELEASE_TAG}" \
+            "${TRITON_WHEEL}" \
+            "${TRITON_PATCH_ASSET}" \
+            triton-a0v2-provenance.json \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "${TRITON_RELEASE_TITLE}" \
+            --notes-file triton-a0v2-release-notes.md
+
+      - name: Add build result to summary
+        if: always()
+        run: |
+          {
+            echo "## MI45X A0 Triton compiler v2"
+            echo
+            echo "- Base: ${TRITON_BASE_COMMIT}"
+            echo "- Disable multicast reference: ${TRITON_MULTICAST_COMMIT}"
+            echo "- Release: ${TRITON_RELEASE_TAG}"
+            if [[ -n "${TRITON_WHEEL_NAME:-}" ]]; then
+              echo "- Wheel: ${TRITON_WHEEL_NAME}"
+              echo "- SHA-256: ${TRITON_WHEEL_SHA256}"
+              echo "- Bytes: ${TRITON_WHEEL_BYTES}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

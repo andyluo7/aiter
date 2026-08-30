@@ -1,0 +1,49 @@
+diff --git a/third_party/amd/backend/compiler.py b/third_party/amd/backend/compiler.py
+index dcde8e68e..2c0b80433 100644
+--- a/third_party/amd/backend/compiler.py
++++ b/third_party/amd/backend/compiler.py
+@@ -546 +546 @@ class HIPBackend(BaseBackend):
+-        flags = []
++        flags = ['-amdgpu-gfx1250-b0-specific=0']
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp
+index 242a4cfea..4ee910cf3 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp
+@@ -396,0 +397,5 @@ Value emitCtaMulticastMask(RewriterBase &rewriter, Location loc, Value groupId,
++  // gfx1250 A0 does not support the multicast-mask path used by later
++  // revisions. This branch builds the dedicated revision-zero compiler wheel,
++  // so force the lowering to use the unicast path.
++  return Value();
++
+diff --git a/third_party/amd/lib/TritonAMDGPUTransforms/WmmaGroup.cpp b/third_party/amd/lib/TritonAMDGPUTransforms/WmmaGroup.cpp
+index 40c62d6f9..0fffc2eea 100644
+--- a/third_party/amd/lib/TritonAMDGPUTransforms/WmmaGroup.cpp
++++ b/third_party/amd/lib/TritonAMDGPUTransforms/WmmaGroup.cpp
+@@ -127,3 +127,3 @@ WmmaDatabase::WmmaDatabase(MLIRContext *context) {
+-      TRITON_WMMA_v_2case(3, 16, 16, ocpFp8T, ocpFp8T, 8, f32T,
+-                          "llvm.amdgcn.wmma.f32.16x16x128.fp8.fp8", 128, 64,
+-                          "llvm.amdgcn.wmma.f32.16x16x64.fp8.fp8", 64, 32),
++      TRITON_WMMA_v(3, 16, 16, ocpFp8T, ocpFp8T, 8, f32T,
++                    // "llvm.amdgcn.wmma.f32.16x16x128.fp8.fp8", 128, 64,
++                    "llvm.amdgcn.wmma.f32.16x16x64.fp8.fp8", 64, 32),
+@@ -134,3 +134,3 @@ WmmaDatabase::WmmaDatabase(MLIRContext *context) {
+-      TRITON_WMMA_v_2case(3, 16, 16, ocpFp8T, ocpBf8T, 8, f32T,
+-                          "llvm.amdgcn.wmma.f32.16x16x128.fp8.bf8", 128, 64,
+-                          "llvm.amdgcn.wmma.f32.16x16x64.fp8.bf8", 64, 32),
++      TRITON_WMMA_v(3, 16, 16, ocpFp8T, ocpBf8T, 8, f32T,
++                    // "llvm.amdgcn.wmma.f32.16x16x128.fp8.bf8", 128, 64,
++                    "llvm.amdgcn.wmma.f32.16x16x64.fp8.bf8", 64, 32),
+@@ -141,3 +141,3 @@ WmmaDatabase::WmmaDatabase(MLIRContext *context) {
+-      TRITON_WMMA_v_2case(3, 16, 16, ocpBf8T, ocpFp8T, 8, f32T,
+-                          "llvm.amdgcn.wmma.f32.16x16x128.bf8.fp8", 128, 64,
+-                          "llvm.amdgcn.wmma.f32.16x16x64.bf8.fp8", 64, 32),
++      TRITON_WMMA_v(3, 16, 16, ocpBf8T, ocpFp8T, 8, f32T,
++                    // "llvm.amdgcn.wmma.f32.16x16x128.bf8.fp8", 128, 64,
++                    "llvm.amdgcn.wmma.f32.16x16x64.bf8.fp8", 64, 32),
+@@ -148,3 +148,3 @@ WmmaDatabase::WmmaDatabase(MLIRContext *context) {
+-      TRITON_WMMA_v_2case(3, 16, 16, ocpBf8T, ocpBf8T, 8, f32T,
+-                          "llvm.amdgcn.wmma.f32.16x16x128.bf8.bf8", 128, 64,
+-                          "llvm.amdgcn.wmma.f32.16x16x64.bf8.bf8", 64, 32),
++      TRITON_WMMA_v(3, 16, 16, ocpBf8T, ocpBf8T, 8, f32T,
++                    // "llvm.amdgcn.wmma.f32.16x16x128.bf8.bf8", 128, 64,
++                    "llvm.amdgcn.wmma.f32.16x16x64.bf8.bf8", 64, 32),
