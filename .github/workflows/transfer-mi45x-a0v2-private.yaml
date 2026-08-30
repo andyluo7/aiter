@@ -1,0 +1,47 @@
+name: Transfer MI45X A0 v2 privately
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      EXPECTED_SHA256: 51cf0eaef85be92b501dea3700f0bbc89dd3ed05f4acbdf32bbc218d21ffc19b
+      PRIVATE_RELEASE_TAG: triton-e411a7fd-gfx1250-a0v2
+      PRIVATE_REPOSITORY: andyluo7/aiter-mi45x-ci
+      PUBLIC_RELEASE_TAG: temporary-triton-e411a7fd-gfx1250-a0v2
+      WHEEL_NAME: triton-3.8.0+gite411a7fd.gfx1250a0v2-cp312-cp312-linux_x86_64.whl
+
+    steps:
+      - name: Download and verify public-source build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir transfer
+          gh release download "${PUBLIC_RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${WHEEL_NAME}" \
+            --dir transfer
+          echo "${EXPECTED_SHA256}  transfer/${WHEEL_NAME}" | sha256sum --check --strict
+
+      - name: Upload and verify private release asset
+        env:
+          GH_TOKEN: ${{ secrets.MI45X_PRIVATE_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN}"
+          gh release upload "${PRIVATE_RELEASE_TAG}" \
+            "transfer/${WHEEL_NAME}" \
+            --repo "${PRIVATE_REPOSITORY}"
+          actual="$(gh release view "${PRIVATE_RELEASE_TAG}" \
+            --repo "${PRIVATE_REPOSITORY}" \
+            --json assets \
+            --jq ".assets[] | select(.name == \"${WHEEL_NAME}\") | .digest")"
+          test "${actual}" = "sha256:${EXPECTED_SHA256}"
+          echo "Verified ${WHEEL_NAME}: ${actual}"
