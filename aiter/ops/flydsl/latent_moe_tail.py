@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Narrow BF16 latent-MoE local-tail primitive."""
+"""Small-batch BF16 latent-MoE local-tail primitive."""
 
 import functools
 import math
@@ -13,12 +13,14 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 
 _LATENT_DIM = 3584
 _HIDDEN_DIM = 7168
-_B1_ROWS_PER_BLOCK = 14
-_B1_WAVES_PER_EU = 4
+_MAX_TOKENS = 14
+_ROWS_PER_BLOCK = 14
+_WAVES_PER_EU = 4
 # Policy 2 bypasses cache levels that would otherwise retain the one-use
 # 49 MiB projection matrix. It is the same FlyDSL cache modifier used by
 # existing streamed mixed-MoE weight loads.
 _B1_WEIGHT_CACHE_MODIFIER = 2
+_MULTI_TOKEN_WEIGHT_CACHE_MODIFIER = 0
 
 
 def _is_gfx950_flydsl_available() -> bool:
@@ -37,16 +39,18 @@ def supports_latent_moe_tail(
     up_weight: torch.Tensor,
     epsilon: float,
 ) -> bool:
-    """Return whether the fixed gfx950 BF16 primitive supports these tensors."""
+    """Return whether the gfx950 BF16 primitive supports these tensors."""
 
     tensors = (routed, shared, rms_weight, up_weight)
+    num_tokens = routed.shape[0] if routed.dim() == 2 else 0
     return (
         all(tensor.is_cuda for tensor in tensors)
         and len({tensor.device for tensor in tensors}) == 1
         and all(tensor.dtype == torch.bfloat16 for tensor in tensors)
         and all(tensor.is_contiguous() for tensor in tensors)
-        and tuple(routed.shape) == (1, _LATENT_DIM)
-        and tuple(shared.shape) == (1, _HIDDEN_DIM)
+        and 1 <= num_tokens <= _MAX_TOKENS
+        and tuple(routed.shape) == (num_tokens, _LATENT_DIM)
+        and tuple(shared.shape) == (num_tokens, _HIDDEN_DIM)
         and tuple(rms_weight.shape) == (_LATENT_DIM,)
         and tuple(up_weight.shape) == (_HIDDEN_DIM, _LATENT_DIM)
         and math.isfinite(epsilon)
@@ -56,7 +60,8 @@ def supports_latent_moe_tail(
 
 
 @functools.cache
-def _compiled_b1_latent_moe_tail(
+def _compiled_latent_moe_tail(
+    num_tokens: int,
     rows_per_block: int,
     waves_per_eu: int,
     normalize_in_kernel: bool,
@@ -65,10 +70,11 @@ def _compiled_b1_latent_moe_tail(
     weight_cache_modifier: int,
 ):
     from aiter.ops.flydsl.kernels.latent_moe_tail_gfx950 import (
-        build_b1_latent_moe_tail_module,
+        build_latent_moe_tail_module,
     )
 
-    return build_b1_latent_moe_tail_module(
+    return build_latent_moe_tail_module(
+        num_tokens,
         rows_per_block,
         waves_per_eu,
         normalize_in_kernel,
@@ -78,7 +84,7 @@ def _compiled_b1_latent_moe_tail(
     )
 
 
-def _launch_b1_latent_moe_tail(
+def _launch_latent_moe_tail(
     routed: torch.Tensor,
     shared: torch.Tensor,
     rms_weight: torch.Tensor,
@@ -95,7 +101,8 @@ def _launch_b1_latent_moe_tail(
 ) -> torch.Tensor:
     from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
-    _compiled_b1_latent_moe_tail(
+    _compiled_latent_moe_tail(
+        routed.shape[0],
         rows_per_block,
         waves_per_eu,
         normalize_in_kernel,
@@ -128,7 +135,7 @@ def latent_moe_tail(
     if not supports_latent_moe_tail(routed, shared, rms_weight, up_weight, epsilon):
         raise NotImplementedError(
             "latent_moe_tail requires contiguous gfx950 BF16 tensors with "
-            "shapes (1,3584), (1,7168), (3584,), and (7168,3584)"
+            "1-14 tokens and trailing dimensions 3584 and 7168"
         )
     if out is None:
         out = torch.empty_like(shared)
@@ -136,19 +143,24 @@ def latent_moe_tail(
         out.device != routed.device
         or out.dtype != torch.bfloat16
         or not out.is_contiguous()
-        or tuple(out.shape) != (1, _HIDDEN_DIM)
+        or tuple(out.shape) != tuple(shared.shape)
     ):
         raise ValueError(
-            "out must be contiguous BF16 shape (1, 7168) on the input device"
+            "out must match the contiguous BF16 shared tensor on the input device"
         )
-    return _launch_b1_latent_moe_tail(
+    num_tokens = routed.shape[0]
+    return _launch_latent_moe_tail(
         routed,
         shared,
         rms_weight,
         up_weight,
         epsilon,
         out=out,
-        rows_per_block=_B1_ROWS_PER_BLOCK,
-        waves_per_eu=_B1_WAVES_PER_EU,
-        weight_cache_modifier=_B1_WEIGHT_CACHE_MODIFIER,
+        rows_per_block=_ROWS_PER_BLOCK,
+        waves_per_eu=_WAVES_PER_EU,
+        weight_cache_modifier=(
+            _B1_WEIGHT_CACHE_MODIFIER
+            if num_tokens == 1
+            else _MULTI_TOKEN_WEIGHT_CACHE_MODIFIER
+        ),
     )

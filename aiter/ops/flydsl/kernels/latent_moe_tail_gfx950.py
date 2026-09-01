@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fixed-shape gfx950 BF16 RMSNorm, GEMV, and add kernel."""
+"""Small-batch gfx950 BF16 RMSNorm, GEMV, and add kernel."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -37,7 +37,8 @@ def _lds_store(ptr, value, index):
     fx.ptr_store(value, ptr + fx.Int64(index))
 
 
-def build_b1_latent_moe_tail_module(
+def build_latent_moe_tail_module(
+    num_tokens: int,
     rows_per_block: int = 4,
     waves_per_eu: int = 0,
     normalize_in_kernel: bool = True,
@@ -45,8 +46,10 @@ def build_b1_latent_moe_tail_module(
     use_dot2: bool = True,
     weight_cache_modifier: int = 0,
 ):
-    """Build a B1 launcher with one multi-row workgroup per output tile."""
+    """Build a launcher with one workgroup per token and output tile."""
 
+    if not 1 <= num_tokens <= 14:
+        raise ValueError("num_tokens must be between 1 and 14")
     if not 2 <= rows_per_block <= 64:
         raise ValueError("rows_per_block must be between 2 and 64")
     if waves_per_eu < 0:
@@ -74,7 +77,7 @@ def build_b1_latent_moe_tail_module(
         dot_sums: fx.Array[fx.Float32, rows_per_block * waves, 16]
 
     kernel_name = (
-        f"latent_moe_tail_b1_bf16_gfx950_r{rows_per_block}"
+        f"latent_moe_tail_m{num_tokens}_bf16_gfx950_r{rows_per_block}"
         f"_wpe{waves_per_eu}_norm{int(normalize_in_kernel)}"
         f"_ept{elements_per_thread}"
         f"_dot2{int(use_dot2)}"
@@ -100,10 +103,15 @@ def build_b1_latent_moe_tail_module(
         tid = ArithValue(gpu.thread_idx.x)
         lane = tid % arith.constant(_WAVE_SIZE, type=i32)
         wave = tid // arith.constant(_WAVE_SIZE, type=i32)
-        output_base = ArithValue(gpu.block_idx.x) * arith.constant(
-            rows_per_block, type=i32
-        )
+        linear_block = ArithValue(gpu.block_idx.x)
+        token_count = arith.constant(num_tokens, type=i32)
+        # Adjacent workgroups reuse the same weight rows for different tokens.
+        token = ArithValue(arith.remui(_raw(linear_block), token_count))
+        output_tile = ArithValue(arith.divui(_raw(linear_block), token_count))
+        output_base = output_tile * arith.constant(rows_per_block, type=i32)
         k_base = tid * arith.constant(elements_per_thread, type=i32)
+        routed_base = token * arith.constant(_LATENT_DIM, type=i32)
+        hidden_base = token * arith.constant(_HIDDEN_DIM, type=i32)
 
         routed_rsrc = ptr_rsrc(routed)
         shared_rsrc = ptr_rsrc(shared)
@@ -131,10 +139,13 @@ def build_b1_latent_moe_tail_module(
             )
             return vector.bitcast(vec8_bf16, dwords)
 
-        def load_bf16x8_masked(resource, element_index):
+        def load_bf16x8_masked(resource, element_index, row_base=None):
+            resource_element = (
+                element_index if row_base is None else row_base + element_index
+            )
             if const_expr(block_threads * elements_per_thread == _LATENT_DIM):
                 return load_bf16x8(
-                    resource, element_index // arith.constant(2, type=i32)
+                    resource, resource_element // arith.constant(2, type=i32)
                 )
             valid = arith.cmpi(
                 CmpIPredicate.ult,
@@ -144,7 +155,7 @@ def build_b1_latent_moe_tail_module(
             load_if = scf.IfOp(valid, results_=[vec8_bf16], has_else=True)
             with ir.InsertionPoint(load_if.then_block):
                 loaded = load_bf16x8(
-                    resource, element_index // arith.constant(2, type=i32)
+                    resource, resource_element // arith.constant(2, type=i32)
                 )
                 scf.YieldOp([_raw(loaded)])
             with ir.InsertionPoint(load_if.else_block):
@@ -213,7 +224,7 @@ def build_b1_latent_moe_tail_module(
         routed_f32_vectors = []
         for vector_index in range_constexpr(vectors_per_thread):
             element_index = k_base + arith.constant(vector_index * 8, type=i32)
-            routed_bf16 = load_bf16x8_masked(routed_rsrc, element_index)
+            routed_bf16 = load_bf16x8_masked(routed_rsrc, element_index, routed_base)
             routed_f32_vectors.append(ArithValue(routed_bf16).extf(vec8_f32))
         is_lane_zero = arith.cmpi(CmpIPredicate.eq, lane, arith.constant(0, type=i32))
         if const_expr(normalize_in_kernel):
@@ -339,12 +350,13 @@ def build_b1_latent_moe_tail_module(
                 dot = dot + _lds_load(dot_sums, index)
             projected_bf16 = arith.trunc_f(T.bf16, _raw(dot))
             projected_f32 = ArithValue(arith.extf(f32, projected_bf16))
+            token_output_index = hidden_base + output_index
             shared_bf16 = buffer_ops.buffer_load(
-                shared_rsrc, output_index, vec_width=1, dtype=T.bf16
+                shared_rsrc, token_output_index, vec_width=1, dtype=T.bf16
             )
             shared_f32 = ArithValue(arith.extf(f32, shared_bf16))
             result = arith.trunc_f(T.bf16, _raw(projected_f32 + shared_f32))
-            buffer_ops.buffer_store(result, output_rsrc, output_index)
+            buffer_ops.buffer_store(result, output_rsrc, token_output_index)
             scf.YieldOp([])
 
     @flyc.jit
@@ -376,7 +388,7 @@ def build_b1_latent_moe_tail_module(
             epsilon,
         ).launch(
             grid=(
-                (_HIDDEN_DIM + rows_per_block - 1) // rows_per_block,
+                ((_HIDDEN_DIM + rows_per_block - 1) // rows_per_block) * num_tokens,
                 1,
                 1,
             ),

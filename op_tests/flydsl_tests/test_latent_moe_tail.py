@@ -31,10 +31,14 @@ HIDDEN_DIM = 7168
 EPSILON = 1.0e-6
 
 
-def _inputs(seed: int = 20260728):
+def _inputs(num_tokens: int = 1, seed: int = 20260728):
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    routed = torch.randn((1, LATENT_DIM), generator=generator).bfloat16().cuda()
-    shared = torch.randn((1, HIDDEN_DIM), generator=generator).bfloat16().cuda()
+    routed = (
+        torch.randn((num_tokens, LATENT_DIM), generator=generator).bfloat16().cuda()
+    )
+    shared = (
+        torch.randn((num_tokens, HIDDEN_DIM), generator=generator).bfloat16().cuda()
+    )
     rms_weight = torch.randn(LATENT_DIM, generator=generator).bfloat16().cuda()
     up_weight = (
         torch.randn((HIDDEN_DIM, LATENT_DIM), generator=generator, dtype=torch.float32)
@@ -54,9 +58,12 @@ def _oracle(routed, shared, rms_weight, up_weight):
     return (projected.float() + shared.float()).bfloat16()
 
 
-@pytest.mark.parametrize("seed", [1, 17, 20260728])
-def test_latent_moe_tail_matches_explicit_fp32_oracle(seed):
-    routed, shared, rms_weight, up_weight = _inputs(seed)
+@pytest.mark.parametrize(
+    ("num_tokens", "seed"),
+    [(1, 1), (2, 17), (7, 1), (7, 17), (7, 20260728), (14, 20260728)],
+)
+def test_latent_moe_tail_matches_explicit_fp32_oracle(num_tokens, seed):
+    routed, shared, rms_weight, up_weight = _inputs(num_tokens, seed)
     routed_before = routed.clone()
     shared_before = shared.clone()
 
@@ -70,25 +77,21 @@ def test_latent_moe_tail_matches_explicit_fp32_oracle(seed):
 
 
 def test_latent_moe_tail_support_predicate_is_narrow():
-    routed, shared, rms_weight, up_weight = _inputs()
-    noncontiguous = torch.empty((LATENT_DIM, 2), dtype=torch.bfloat16, device="cuda")[
-        :, 0
-    ].unsqueeze(0)
+    routed, shared, rms_weight, up_weight = _inputs(7)
+    noncontiguous = torch.empty(
+        (7, LATENT_DIM, 2), dtype=torch.bfloat16, device="cuda"
+    )[:, :, 0]
 
     assert supports_latent_moe_tail(routed, shared, rms_weight, up_weight, EPSILON)
     assert not supports_latent_moe_tail(
-        routed.expand(8, -1),
-        shared.expand(8, -1),
+        routed[:1].expand(15, -1).clone(),
+        shared[:1].expand(15, -1).clone(),
         rms_weight,
         up_weight,
         EPSILON,
     )
     assert not supports_latent_moe_tail(
-        routed.expand(16, -1),
-        shared.expand(16, -1),
-        rms_weight,
-        up_weight,
-        EPSILON,
+        routed, shared[:2], rms_weight, up_weight, EPSILON
     )
     assert not supports_latent_moe_tail(
         noncontiguous, shared, rms_weight, up_weight, EPSILON
@@ -106,17 +109,17 @@ def test_latent_moe_tail_support_predicate_is_narrow():
 
 
 def test_latent_moe_tail_rejects_noncontiguous_input():
-    _, shared, rms_weight, up_weight = _inputs()
-    routed = torch.empty((LATENT_DIM, 2), dtype=torch.bfloat16, device="cuda")[
-        :, 0
-    ].unsqueeze(0)
+    _, shared, rms_weight, up_weight = _inputs(7)
+    routed = torch.empty((7, LATENT_DIM, 2), dtype=torch.bfloat16, device="cuda")[
+        :, :, 0
+    ]
 
     with pytest.raises(NotImplementedError, match="requires contiguous gfx950"):
         latent_moe_tail(routed, shared, rms_weight, up_weight, EPSILON)
 
 
 def test_latent_moe_tail_graph_capture_and_output_reuse():
-    routed, shared, rms_weight, up_weight = _inputs()
+    routed, shared, rms_weight, up_weight = _inputs(7)
     out = torch.empty_like(shared)
     latent_moe_tail(
         routed,
@@ -138,6 +141,12 @@ def test_latent_moe_tail_graph_capture_and_output_reuse():
             EPSILON,
             out=out,
         )
+
+    changed = _inputs(7, seed=20260901)
+    for destination, source in zip(
+        (routed, shared, rms_weight, up_weight), changed, strict=True
+    ):
+        destination.copy_(source)
     graph.replay()
     torch.cuda.synchronize()
 
