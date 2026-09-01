@@ -43,6 +43,7 @@ def build_latent_moe_tail_module(
     rows_per_block: int = 4,
     waves_per_eu: int = 0,
     normalize_in_kernel: bool = True,
+    add_shared: bool = True,
     elements_per_thread: int = 8,
     use_dot2: bool = True,
     weight_cache_modifier: int = 0,
@@ -88,6 +89,7 @@ def build_latent_moe_tail_module(
         f"latent_moe_tail_m{num_tokens}_bf16_gfx950_r{rows_per_block}"
         f"_t{tokens_per_block}"
         f"_wpe{waves_per_eu}_norm{int(normalize_in_kernel)}"
+        f"_add{int(add_shared)}"
         f"_ept{elements_per_thread}"
         f"_dot2{int(use_dot2)}"
         f"_wcm{weight_cache_modifier}"
@@ -437,15 +439,18 @@ def build_latent_moe_tail_module(
                 )
                 dot = dot + _lds_load(dot_sums, index)
             projected_bf16 = arith.trunc_f(T.bf16, _raw(dot))
-            projected_f32 = ArithValue(arith.extf(f32, projected_bf16))
             token_output_index = (
                 output_token * arith.constant(_HIDDEN_DIM, type=i32) + output_index
             )
-            shared_bf16 = buffer_ops.buffer_load(
-                shared_rsrc, token_output_index, vec_width=1, dtype=T.bf16
-            )
-            shared_f32 = ArithValue(arith.extf(f32, shared_bf16))
-            result = arith.trunc_f(T.bf16, _raw(projected_f32 + shared_f32))
+            if const_expr(add_shared):
+                projected_f32 = ArithValue(arith.extf(f32, projected_bf16))
+                shared_bf16 = buffer_ops.buffer_load(
+                    shared_rsrc, token_output_index, vec_width=1, dtype=T.bf16
+                )
+                shared_f32 = ArithValue(arith.extf(f32, shared_bf16))
+                result = arith.trunc_f(T.bf16, _raw(projected_f32 + shared_f32))
+            else:
+                result = projected_bf16
             buffer_ops.buffer_store(result, output_rsrc, token_output_index)
             scf.YieldOp([])
 

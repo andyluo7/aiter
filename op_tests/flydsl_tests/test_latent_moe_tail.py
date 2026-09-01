@@ -6,8 +6,10 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.latent_moe_tail import (
+    latent_moe_projection,
     latent_moe_projection_add,
     latent_moe_tail,
+    supports_latent_moe_projection,
     supports_latent_moe_projection_add,
     supports_latent_moe_tail,
 )
@@ -129,6 +131,25 @@ def test_token_tiled_projection_add_matches_oracle(tokens_per_block, rows_per_bl
     torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.015625)
 
 
+@pytest.mark.parametrize(
+    ("tokens_per_block", "rows_per_block"),
+    [(1, 14), (2, 7), (4, 4), (7, 2)],
+)
+def test_token_tiled_projection_matches_oracle(tokens_per_block, rows_per_block):
+    normalized, _, _, up_weight = _inputs(7, seed=20260905)
+
+    actual = latent_moe_projection(
+        normalized,
+        up_weight,
+        tokens_per_block=tokens_per_block,
+        rows_per_block=rows_per_block,
+    )
+    expected = torch.mm(normalized.float(), up_weight.float().T).bfloat16()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.015625)
+
+
 def test_latent_moe_tail_support_predicate_is_narrow():
     routed, shared, rms_weight, up_weight = _inputs(7)
     noncontiguous = torch.empty(
@@ -159,6 +180,9 @@ def test_latent_moe_tail_support_predicate_is_narrow():
         routed, shared, rms_weight, up_weight, float("inf")
     )
     assert not supports_latent_moe_tail(routed, shared, rms_weight, up_weight, 0.0)
+    assert supports_latent_moe_projection(routed, up_weight)
+    assert not supports_latent_moe_projection(noncontiguous, up_weight)
+    assert not supports_latent_moe_projection(routed, up_weight.float())
     assert supports_latent_moe_projection_add(routed, shared, up_weight)
     assert not supports_latent_moe_projection_add(routed, shared[:2], up_weight)
     assert not supports_latent_moe_projection_add(noncontiguous, shared, up_weight)
@@ -297,6 +321,37 @@ def test_token_tiled_projection_add_graph_capture_and_output_reuse():
     torch.testing.assert_close(
         actual,
         _projection_oracle(normalized, shared, up_weight),
+        rtol=0.01,
+        atol=0.015625,
+    )
+
+
+def test_token_tiled_projection_graph_capture_and_output_reuse():
+    normalized, _, _, up_weight = _inputs(7)
+    out = torch.empty((7, HIDDEN_DIM), dtype=torch.bfloat16, device="cuda")
+    kwargs = {"tokens_per_block": 7, "rows_per_block": 2}
+    latent_moe_projection(normalized, up_weight, out=out, **kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+
+    with torch.cuda.graph(graph):
+        actual = latent_moe_projection(
+            normalized,
+            up_weight,
+            out=out,
+            **kwargs,
+        )
+
+    changed_normalized, _, _, changed_up_weight = _inputs(7, seed=20260906)
+    normalized.copy_(changed_normalized)
+    up_weight.copy_(changed_up_weight)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert actual is out
+    torch.testing.assert_close(
+        actual,
+        torch.mm(normalized.float(), up_weight.float().T).bfloat16(),
         rtol=0.01,
         atol=0.015625,
     )

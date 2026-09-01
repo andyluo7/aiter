@@ -59,14 +59,13 @@ def supports_latent_moe_tail(
     )
 
 
-def supports_latent_moe_projection_add(
+def supports_latent_moe_projection(
     normalized: torch.Tensor,
-    shared: torch.Tensor,
     up_weight: torch.Tensor,
 ) -> bool:
-    """Return whether the gfx950 BF16 projection-add primitive is supported."""
+    """Return whether the gfx950 BF16 projection primitive is supported."""
 
-    tensors = (normalized, shared, up_weight)
+    tensors = (normalized, up_weight)
     num_tokens = normalized.shape[0] if normalized.dim() == 2 else 0
     return (
         all(tensor.is_cuda for tensor in tensors)
@@ -75,9 +74,25 @@ def supports_latent_moe_projection_add(
         and all(tensor.is_contiguous() for tensor in tensors)
         and 1 <= num_tokens <= _MAX_TOKENS
         and tuple(normalized.shape) == (num_tokens, _LATENT_DIM)
-        and tuple(shared.shape) == (num_tokens, _HIDDEN_DIM)
         and tuple(up_weight.shape) == (_HIDDEN_DIM, _LATENT_DIM)
         and _is_gfx950_flydsl_available()
+    )
+
+
+def supports_latent_moe_projection_add(
+    normalized: torch.Tensor,
+    shared: torch.Tensor,
+    up_weight: torch.Tensor,
+) -> bool:
+    """Return whether the gfx950 BF16 projection-add primitive is supported."""
+
+    return (
+        supports_latent_moe_projection(normalized, up_weight)
+        and shared.is_cuda
+        and shared.device == normalized.device
+        and shared.dtype == torch.bfloat16
+        and shared.is_contiguous()
+        and tuple(shared.shape) == (normalized.shape[0], _HIDDEN_DIM)
     )
 
 
@@ -88,6 +103,7 @@ def _compiled_latent_moe_tail(
     rows_per_block: int,
     waves_per_eu: int,
     normalize_in_kernel: bool,
+    add_shared: bool,
     elements_per_thread: int,
     use_dot2: bool,
     weight_cache_modifier: int,
@@ -102,6 +118,7 @@ def _compiled_latent_moe_tail(
         rows_per_block,
         waves_per_eu,
         normalize_in_kernel,
+        add_shared,
         elements_per_thread,
         use_dot2,
         weight_cache_modifier,
@@ -120,6 +137,7 @@ def _launch_latent_moe_tail(
     rows_per_block: int,
     waves_per_eu: int,
     normalize_in_kernel: bool = True,
+    add_shared: bool = True,
     elements_per_thread: int = 8,
     use_dot2: bool = True,
     weight_cache_modifier: int = 0,
@@ -132,6 +150,7 @@ def _launch_latent_moe_tail(
         rows_per_block,
         waves_per_eu,
         normalize_in_kernel,
+        add_shared,
         elements_per_thread,
         use_dot2,
         weight_cache_modifier,
@@ -158,17 +177,17 @@ def _validate_tiling(
 
 def _validate_output(
     out: torch.Tensor,
-    reference: torch.Tensor,
+    shape: tuple[int, ...],
     device: torch.device,
 ) -> None:
     if (
         out.device != device
         or out.dtype != torch.bfloat16
         or not out.is_contiguous()
-        or tuple(out.shape) != tuple(reference.shape)
+        or tuple(out.shape) != shape
     ):
         raise ValueError(
-            "out must match the contiguous BF16 shared tensor on the input device"
+            "out must match the contiguous BF16 output shape on the input device"
         )
 
 
@@ -195,7 +214,7 @@ def latent_moe_tail(
     if out is None:
         out = torch.empty_like(shared)
     else:
-        _validate_output(out, shared, routed.device)
+        _validate_output(out, tuple(shared.shape), routed.device)
     return _launch_latent_moe_tail(
         routed,
         shared,
@@ -235,7 +254,7 @@ def latent_moe_projection_add(
     if out is None:
         out = torch.empty_like(shared)
     else:
-        _validate_output(out, shared, normalized.device)
+        _validate_output(out, tuple(shared.shape), normalized.device)
     return _launch_latent_moe_tail(
         normalized,
         shared,
@@ -247,6 +266,52 @@ def latent_moe_projection_add(
         rows_per_block=rows_per_block,
         waves_per_eu=_WAVES_PER_EU,
         normalize_in_kernel=False,
+        add_shared=True,
+        weight_cache_modifier=(
+            _B1_WEIGHT_CACHE_MODIFIER
+            if num_tokens == 1
+            else _MULTI_TOKEN_WEIGHT_CACHE_MODIFIER
+        ),
+    )
+
+
+def latent_moe_projection(
+    normalized: torch.Tensor,
+    up_weight: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    tokens_per_block: int = 1,
+    rows_per_block: int = _ROWS_PER_BLOCK,
+) -> torch.Tensor:
+    """Project normalized BF16 latents without the shared-output add."""
+
+    num_tokens = normalized.shape[0] if normalized.dim() == 2 else 0
+    if not supports_latent_moe_projection(normalized, up_weight):
+        raise NotImplementedError(
+            "latent_moe_projection requires contiguous gfx950 BF16 tensors "
+            "with 1-14 tokens and trailing dimensions 3584 and 7168"
+        )
+    if out is None:
+        out = torch.empty(
+            (num_tokens, _HIDDEN_DIM),
+            dtype=torch.bfloat16,
+            device=normalized.device,
+        )
+    else:
+        _validate_output(out, (num_tokens, _HIDDEN_DIM), normalized.device)
+    _validate_tiling(num_tokens, tokens_per_block, rows_per_block)
+    return _launch_latent_moe_tail(
+        normalized,
+        out,
+        normalized,
+        up_weight,
+        1.0,
+        out=out,
+        tokens_per_block=tokens_per_block,
+        rows_per_block=rows_per_block,
+        waves_per_eu=_WAVES_PER_EU,
+        normalize_in_kernel=False,
+        add_shared=False,
         weight_cache_modifier=(
             _B1_WEIGHT_CACHE_MODIFIER
             if num_tokens == 1
