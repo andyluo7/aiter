@@ -6,7 +6,9 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.latent_moe_tail import (
+    latent_moe_projection_add,
     latent_moe_tail,
+    supports_latent_moe_projection_add,
     supports_latent_moe_tail,
 )
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -58,6 +60,11 @@ def _oracle(routed, shared, rms_weight, up_weight):
     return (projected.float() + shared.float()).bfloat16()
 
 
+def _projection_oracle(normalized, shared, up_weight):
+    projected = torch.mm(normalized.float(), up_weight.float().T).bfloat16()
+    return (projected.float() + shared.float()).bfloat16()
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "seed"),
     [(1, 1), (2, 17), (7, 1), (7, 17), (7, 20260728), (14, 20260728)],
@@ -98,6 +105,30 @@ def test_token_tiled_latent_moe_tail_matches_oracle(tokens_per_block, rows_per_b
     torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.015625)
 
 
+@pytest.mark.parametrize(
+    ("tokens_per_block", "rows_per_block"),
+    [(1, 14), (2, 7), (4, 4), (7, 2)],
+)
+def test_token_tiled_projection_add_matches_oracle(tokens_per_block, rows_per_block):
+    routed, shared, rms_weight, up_weight = _inputs(7, seed=20260903)
+    inverse_rms = torch.rsqrt(
+        routed.float().square().mean(dim=-1, keepdim=True) + EPSILON
+    )
+    normalized = (routed.float() * inverse_rms * rms_weight.float()).bfloat16()
+
+    actual = latent_moe_projection_add(
+        normalized,
+        shared,
+        up_weight,
+        tokens_per_block=tokens_per_block,
+        rows_per_block=rows_per_block,
+    )
+    expected = _projection_oracle(normalized, shared, up_weight)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.015625)
+
+
 def test_latent_moe_tail_support_predicate_is_narrow():
     routed, shared, rms_weight, up_weight = _inputs(7)
     noncontiguous = torch.empty(
@@ -128,6 +159,10 @@ def test_latent_moe_tail_support_predicate_is_narrow():
         routed, shared, rms_weight, up_weight, float("inf")
     )
     assert not supports_latent_moe_tail(routed, shared, rms_weight, up_weight, 0.0)
+    assert supports_latent_moe_projection_add(routed, shared, up_weight)
+    assert not supports_latent_moe_projection_add(routed, shared[:2], up_weight)
+    assert not supports_latent_moe_projection_add(noncontiguous, shared, up_weight)
+    assert not supports_latent_moe_projection_add(routed, shared, up_weight.float())
 
 
 def test_latent_moe_tail_rejects_noncontiguous_input():
@@ -220,6 +255,48 @@ def test_token_tiled_latent_moe_tail_graph_capture_and_output_reuse():
     torch.testing.assert_close(
         actual,
         _oracle(routed, shared, rms_weight, up_weight),
+        rtol=0.01,
+        atol=0.015625,
+    )
+
+
+def test_token_tiled_projection_add_graph_capture_and_output_reuse():
+    normalized, shared, _, up_weight = _inputs(7)
+    out = torch.empty_like(shared)
+    kwargs = {"tokens_per_block": 7, "rows_per_block": 2}
+    latent_moe_projection_add(
+        normalized,
+        shared,
+        up_weight,
+        out=out,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+
+    with torch.cuda.graph(graph):
+        actual = latent_moe_projection_add(
+            normalized,
+            shared,
+            up_weight,
+            out=out,
+            **kwargs,
+        )
+
+    changed_normalized, changed_shared, _, changed_up_weight = _inputs(7, seed=20260904)
+    for destination, source in zip(
+        (normalized, shared, up_weight),
+        (changed_normalized, changed_shared, changed_up_weight),
+        strict=True,
+    ):
+        destination.copy_(source)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert actual is out
+    torch.testing.assert_close(
+        actual,
+        _projection_oracle(normalized, shared, up_weight),
         rtol=0.01,
         atol=0.015625,
     )

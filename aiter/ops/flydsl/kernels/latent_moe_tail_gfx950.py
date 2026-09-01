@@ -230,6 +230,7 @@ def build_latent_moe_tail_module(
             return dot
 
         is_lane_zero = arith.cmpi(CmpIPredicate.eq, lane, arith.constant(0, type=i32))
+        routed_bf16_vectors_by_token = []
         routed_f32_vectors_by_token = []
         wave_square_sums = []
         for token_index in range_constexpr(tokens_per_block):
@@ -243,13 +244,16 @@ def build_latent_moe_tail_module(
                 token_in_range, token, arith.constant(0, type=i32)
             )
             routed_base = ArithValue(safe_token) * arith.constant(_LATENT_DIM, type=i32)
+            routed_bf16_vectors = []
             routed_f32_vectors = []
             for vector_index in range_constexpr(vectors_per_thread):
                 element_index = k_base + arith.constant(vector_index * 8, type=i32)
                 routed_bf16 = load_bf16x8_masked(
                     routed_rsrc, element_index, routed_base
                 )
+                routed_bf16_vectors.append(routed_bf16)
                 routed_f32_vectors.append(ArithValue(routed_bf16).extf(vec8_f32))
+            routed_bf16_vectors_by_token.append(routed_bf16_vectors)
             routed_f32_vectors_by_token.append(routed_f32_vectors)
             if const_expr(normalize_in_kernel):
                 local_square_sum = ArithValue(zero_f32)
@@ -319,6 +323,7 @@ def build_latent_moe_tail_module(
                 normalized_bf16_vectors_by_token.append(normalized_bf16_vectors)
                 normalized_dot_vectors_by_token.append(normalized_dot_vectors)
         else:
+            normalized_bf16_vectors_by_token = routed_bf16_vectors_by_token
             normalized_dot_vectors_by_token = routed_f32_vectors_by_token
 
         accumulators_by_token = [[] for _ in range(tokens_per_block)]
@@ -361,10 +366,10 @@ def build_latent_moe_tail_module(
                     with ir.InsertionPoint(weight_if.else_block):
                         scf.YieldOp([_raw(zero_bf16_vec)])
                     weight_bf16 = weight_if.results[0]
-                if const_expr(not (use_dot2 and normalize_in_kernel)):
+                if const_expr(not use_dot2):
                     weight_f32 = ArithValue(weight_bf16).extf(vec8_f32)
                 for token_index in range_constexpr(tokens_per_block):
-                    if const_expr(use_dot2 and normalize_in_kernel):
+                    if const_expr(use_dot2):
                         local_dots[token_index] = local_dots[token_index] + dot_bf16x8(
                             normalized_bf16_vectors_by_token[token_index][vector_index],
                             weight_bf16,

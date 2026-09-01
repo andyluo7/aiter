@@ -59,6 +59,28 @@ def supports_latent_moe_tail(
     )
 
 
+def supports_latent_moe_projection_add(
+    normalized: torch.Tensor,
+    shared: torch.Tensor,
+    up_weight: torch.Tensor,
+) -> bool:
+    """Return whether the gfx950 BF16 projection-add primitive is supported."""
+
+    tensors = (normalized, shared, up_weight)
+    num_tokens = normalized.shape[0] if normalized.dim() == 2 else 0
+    return (
+        all(tensor.is_cuda for tensor in tensors)
+        and len({tensor.device for tensor in tensors}) == 1
+        and all(tensor.dtype == torch.bfloat16 for tensor in tensors)
+        and all(tensor.is_contiguous() for tensor in tensors)
+        and 1 <= num_tokens <= _MAX_TOKENS
+        and tuple(normalized.shape) == (num_tokens, _LATENT_DIM)
+        and tuple(shared.shape) == (num_tokens, _HIDDEN_DIM)
+        and tuple(up_weight.shape) == (_HIDDEN_DIM, _LATENT_DIM)
+        and _is_gfx950_flydsl_available()
+    )
+
+
 @functools.cache
 def _compiled_latent_moe_tail(
     num_tokens: int,
@@ -125,6 +147,31 @@ def _launch_latent_moe_tail(
     return out
 
 
+def _validate_tiling(
+    num_tokens: int, tokens_per_block: int, rows_per_block: int
+) -> None:
+    if not 1 <= tokens_per_block <= num_tokens:
+        raise ValueError("tokens_per_block must be between 1 and num_tokens")
+    if not 2 <= rows_per_block <= 64:
+        raise ValueError("rows_per_block must be between 2 and 64")
+
+
+def _validate_output(
+    out: torch.Tensor,
+    reference: torch.Tensor,
+    device: torch.device,
+) -> None:
+    if (
+        out.device != device
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or tuple(out.shape) != tuple(reference.shape)
+    ):
+        raise ValueError(
+            "out must match the contiguous BF16 shared tensor on the input device"
+        )
+
+
 def latent_moe_tail(
     routed: torch.Tensor,
     shared: torch.Tensor,
@@ -144,21 +191,11 @@ def latent_moe_tail(
             "1-14 tokens and trailing dimensions 3584 and 7168"
         )
     num_tokens = routed.shape[0]
-    if not 1 <= tokens_per_block <= num_tokens:
-        raise ValueError("tokens_per_block must be between 1 and num_tokens")
-    if not 2 <= rows_per_block <= 64:
-        raise ValueError("rows_per_block must be between 2 and 64")
+    _validate_tiling(num_tokens, tokens_per_block, rows_per_block)
     if out is None:
         out = torch.empty_like(shared)
-    elif (
-        out.device != routed.device
-        or out.dtype != torch.bfloat16
-        or not out.is_contiguous()
-        or tuple(out.shape) != tuple(shared.shape)
-    ):
-        raise ValueError(
-            "out must match the contiguous BF16 shared tensor on the input device"
-        )
+    else:
+        _validate_output(out, shared, routed.device)
     return _launch_latent_moe_tail(
         routed,
         shared,
@@ -169,6 +206,47 @@ def latent_moe_tail(
         tokens_per_block=tokens_per_block,
         rows_per_block=rows_per_block,
         waves_per_eu=_WAVES_PER_EU,
+        weight_cache_modifier=(
+            _B1_WEIGHT_CACHE_MODIFIER
+            if num_tokens == 1
+            else _MULTI_TOKEN_WEIGHT_CACHE_MODIFIER
+        ),
+    )
+
+
+def latent_moe_projection_add(
+    normalized: torch.Tensor,
+    shared: torch.Tensor,
+    up_weight: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    tokens_per_block: int = 1,
+    rows_per_block: int = _ROWS_PER_BLOCK,
+) -> torch.Tensor:
+    """Project normalized BF16 latents and add the BF16 shared output."""
+
+    if not supports_latent_moe_projection_add(normalized, shared, up_weight):
+        raise NotImplementedError(
+            "latent_moe_projection_add requires contiguous gfx950 BF16 tensors "
+            "with 1-14 tokens and trailing dimensions 3584 and 7168"
+        )
+    num_tokens = normalized.shape[0]
+    _validate_tiling(num_tokens, tokens_per_block, rows_per_block)
+    if out is None:
+        out = torch.empty_like(shared)
+    else:
+        _validate_output(out, shared, normalized.device)
+    return _launch_latent_moe_tail(
+        normalized,
+        shared,
+        normalized,
+        up_weight,
+        1.0,
+        out=out,
+        tokens_per_block=tokens_per_block,
+        rows_per_block=rows_per_block,
+        waves_per_eu=_WAVES_PER_EU,
+        normalize_in_kernel=False,
         weight_cache_modifier=(
             _B1_WEIGHT_CACHE_MODIFIER
             if num_tokens == 1
