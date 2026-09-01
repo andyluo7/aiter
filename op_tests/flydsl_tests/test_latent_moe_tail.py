@@ -76,6 +76,28 @@ def test_latent_moe_tail_matches_explicit_fp32_oracle(num_tokens, seed):
     torch.testing.assert_close(shared, shared_before, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    ("tokens_per_block", "rows_per_block"),
+    [(2, 7), (4, 4), (7, 2)],
+)
+def test_token_tiled_latent_moe_tail_matches_oracle(tokens_per_block, rows_per_block):
+    routed, shared, rms_weight, up_weight = _inputs(7, seed=20260901)
+
+    actual = latent_moe_tail(
+        routed,
+        shared,
+        rms_weight,
+        up_weight,
+        EPSILON,
+        tokens_per_block=tokens_per_block,
+        rows_per_block=rows_per_block,
+    )
+    expected = _oracle(routed, shared, rms_weight, up_weight)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.015625)
+
+
 def test_latent_moe_tail_support_predicate_is_narrow():
     routed, shared, rms_weight, up_weight = _inputs(7)
     noncontiguous = torch.empty(
@@ -157,3 +179,66 @@ def test_latent_moe_tail_graph_capture_and_output_reuse():
         rtol=0.01,
         atol=0.015625,
     )
+
+
+def test_token_tiled_latent_moe_tail_graph_capture_and_output_reuse():
+    routed, shared, rms_weight, up_weight = _inputs(7)
+    out = torch.empty_like(shared)
+    kwargs = {"tokens_per_block": 4, "rows_per_block": 4}
+    latent_moe_tail(
+        routed,
+        shared,
+        rms_weight,
+        up_weight,
+        EPSILON,
+        out=out,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+
+    with torch.cuda.graph(graph):
+        actual = latent_moe_tail(
+            routed,
+            shared,
+            rms_weight,
+            up_weight,
+            EPSILON,
+            out=out,
+            **kwargs,
+        )
+
+    changed = _inputs(7, seed=20260902)
+    for destination, source in zip(
+        (routed, shared, rms_weight, up_weight), changed, strict=True
+    ):
+        destination.copy_(source)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert actual is out
+    torch.testing.assert_close(
+        actual,
+        _oracle(routed, shared, rms_weight, up_weight),
+        rtol=0.01,
+        atol=0.015625,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens_per_block", "rows_per_block"),
+    [(0, 14), (8, 2), (1, 1), (1, 65)],
+)
+def test_latent_moe_tail_rejects_invalid_tiling(tokens_per_block, rows_per_block):
+    routed, shared, rms_weight, up_weight = _inputs(7)
+
+    with pytest.raises(ValueError):
+        latent_moe_tail(
+            routed,
+            shared,
+            rms_weight,
+            up_weight,
+            EPSILON,
+            tokens_per_block=tokens_per_block,
+            rows_per_block=rows_per_block,
+        )

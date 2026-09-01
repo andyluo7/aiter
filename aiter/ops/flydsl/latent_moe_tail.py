@@ -62,6 +62,7 @@ def supports_latent_moe_tail(
 @functools.cache
 def _compiled_latent_moe_tail(
     num_tokens: int,
+    tokens_per_block: int,
     rows_per_block: int,
     waves_per_eu: int,
     normalize_in_kernel: bool,
@@ -75,6 +76,7 @@ def _compiled_latent_moe_tail(
 
     return build_latent_moe_tail_module(
         num_tokens,
+        tokens_per_block,
         rows_per_block,
         waves_per_eu,
         normalize_in_kernel,
@@ -92,6 +94,7 @@ def _launch_latent_moe_tail(
     epsilon: float,
     *,
     out: torch.Tensor,
+    tokens_per_block: int,
     rows_per_block: int,
     waves_per_eu: int,
     normalize_in_kernel: bool = True,
@@ -103,6 +106,7 @@ def _launch_latent_moe_tail(
 
     _compiled_latent_moe_tail(
         routed.shape[0],
+        tokens_per_block,
         rows_per_block,
         waves_per_eu,
         normalize_in_kernel,
@@ -129,6 +133,8 @@ def latent_moe_tail(
     epsilon: float,
     *,
     out: torch.Tensor | None = None,
+    tokens_per_block: int = 1,
+    rows_per_block: int = _ROWS_PER_BLOCK,
 ) -> torch.Tensor:
     """Fuse BF16 RMSNorm, FP32-accumulated projection, and BF16 shared add."""
 
@@ -137,6 +143,11 @@ def latent_moe_tail(
             "latent_moe_tail requires contiguous gfx950 BF16 tensors with "
             "1-14 tokens and trailing dimensions 3584 and 7168"
         )
+    num_tokens = routed.shape[0]
+    if not 1 <= tokens_per_block <= num_tokens:
+        raise ValueError("tokens_per_block must be between 1 and num_tokens")
+    if not 2 <= rows_per_block <= 64:
+        raise ValueError("rows_per_block must be between 2 and 64")
     if out is None:
         out = torch.empty_like(shared)
     elif (
@@ -148,7 +159,6 @@ def latent_moe_tail(
         raise ValueError(
             "out must match the contiguous BF16 shared tensor on the input device"
         )
-    num_tokens = routed.shape[0]
     return _launch_latent_moe_tail(
         routed,
         shared,
@@ -156,7 +166,8 @@ def latent_moe_tail(
         up_weight,
         epsilon,
         out=out,
-        rows_per_block=_ROWS_PER_BLOCK,
+        tokens_per_block=tokens_per_block,
+        rows_per_block=rows_per_block,
         waves_per_eu=_WAVES_PER_EU,
         weight_cache_modifier=(
             _B1_WEIGHT_CACHE_MODIFIER
