@@ -5,6 +5,8 @@
 #include "aiter_tensor.h"
 #include <string>
 
+// The selected expert/weight pairs are valid top-k results, but their slot
+// order is not part of this API's contract.
 void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, num_experts]
                          const aiter_tensor_t& correction_bias, // [num_expert]
                          const aiter_tensor_t& topk_weights,    // [num_tokens, topk]
@@ -14,6 +16,8 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
                          bool renormalize,
                          const float routed_scaling_factor = 1.);
 
+// The selected expert/weight pairs are valid top-k results, but their slot
+// order is not part of this API's contract.
 void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_experts]
                   const aiter_tensor_t& topk_weights,  // [num_tokens, topk]
                   const aiter_tensor_t& topk_ids,      // [num_tokens, topk]

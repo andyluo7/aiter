@@ -124,6 +124,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_fused_qk_norm_rope_group_quant.py]=22
     FILE_TIMES[op_tests/test_moe_tkw1.py]=22
     FILE_TIMES[op_tests/test_gemm_a16w16.py]=20
+    FILE_TIMES[op_tests/test_grouped_topk_radix.py]=20
     FILE_TIMES[op_tests/test_mla_stage2_merge.py]=20
     FILE_TIMES[op_tests/test_fused_qk_norm.py]=19
     FILE_TIMES[op_tests/test_layernorm2dFusedAddQuant.py]=18
