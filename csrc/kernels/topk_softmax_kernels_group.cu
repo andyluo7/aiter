@@ -301,11 +301,19 @@ struct radix_topk_traits
     static constexpr int Slots = 4;
 };
 
+static_assert(radix_topk_traits::Slots * 64 * 4 < (1 << 12),
+              "radix hit packing requires 12-bit counts");
+
 // Order-preserving map float -> uint32, so integer compares reproduce float
 // compares. Positive floats keep their order once the sign bit is set;
 // negative floats need a full bit flip.
 __device__ __forceinline__ unsigned int radix_mono_key(float f)
 {
+    // Match the stock grouped-topk kernels: NaNs are never eligible for
+    // selection.  Mapping a positive NaN directly would otherwise rank it
+    // above +infinity in the monotonic unsigned representation.
+    if(::isnan(f))
+        f = -INFINITY;
     unsigned int b = __builtin_bit_cast(unsigned int, f);
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
@@ -313,65 +321,25 @@ __device__ __forceinline__ unsigned int radix_mono_key(float f)
 // Set bits strictly below this lane. mbcnt is the native wave prefix popcount.
 __device__ __forceinline__ int radix_ballot_rank(unsigned long long m)
 {
-    return static_cast<int>(__builtin_amdgcn_mbcnt_hi(
-        static_cast<unsigned int>(m >> 32),
-        __builtin_amdgcn_mbcnt_lo(static_cast<unsigned int>(m), 0u)));
+    return static_cast<int>(
+        __builtin_amdgcn_mbcnt_hi(static_cast<unsigned int>(m >> 32),
+                                  __builtin_amdgcn_mbcnt_lo(static_cast<unsigned int>(m), 0u)));
 }
 
-template <int CTRL, int ROW_MASK, int BANK_MASK, typename T>
-__device__ __forceinline__ T radix_dpp_fetch(T x)
-{
-    // old = 0, so lanes disabled by the masks and lanes whose source lane is
-    // out of range contribute nothing to the accumulation.
-    return __builtin_bit_cast(T,
-                              __builtin_amdgcn_update_dpp(0,
-                                                          __builtin_bit_cast(int, x),
-                                                          CTRL,
-                                                          ROW_MASK,
-                                                          BANK_MASK,
-                                                          false));
-}
-
-// Inclusive add scan across the wave, kept in the VALU. Hillis-Steele via
-// row_shr inside each row of 16 lanes, then row_bcast to carry across rows.
-// This is the hot alternative to a __shfl_up chain, which lowers to
-// ds_bpermute and pays LDS latency on every step.
+// gfx950 supports the row-broadcast DPP instructions needed to carry an
+// inclusive scan across all four 16-lane rows. Reuse warp_sort.h's DPP wrapper
+// so the intrinsic lowering remains centralized while avoiding the
+// ds_bpermute cross-row fallback used by the architecture-generic scan.
 template <typename T>
 __device__ __forceinline__ T radix_wave_scan_add(T x)
 {
-#if defined(__GFX9__)
-    x += radix_dpp_fetch<0x111, 0xf, 0xf>(x); // row_shr:1
-    x += radix_dpp_fetch<0x112, 0xf, 0xf>(x); // row_shr:2
-    x += radix_dpp_fetch<0x114, 0xf, 0xf>(x); // row_shr:4
-    x += radix_dpp_fetch<0x118, 0xf, 0xf>(x); // row_shr:8
-    x += radix_dpp_fetch<0x142, 0xa, 0xf>(x); // row_bcast:15 -> rows 1,3
-    if constexpr(WARP_SIZE > 32)
-        x += radix_dpp_fetch<0x143, 0xc, 0xf>(x); // row_bcast:31 -> rows 2,3
+    x += upd_dpp_(0, x, opus::number<0x111>{});                      // row_shr:1
+    x += upd_dpp_(0, x, opus::number<0x112>{});                      // row_shr:2
+    x += upd_dpp_(0, x, opus::number<0x114>{});                      // row_shr:4
+    x += upd_dpp_(0, x, opus::number<0x118>{});                      // row_shr:8
+    x += upd_dpp_(0, x, opus::number<0x142>{}, opus::number<0xa>{}); // row_bcast:15
+    x += upd_dpp_(0, x, opus::number<0x143>{}, opus::number<0xc>{}); // row_bcast:31
     return x;
-#else
-    // GFX10+ dropped the row_bcast DPP modes this scan carries rows with
-    // ("broadcasts are not supported on GFX10+"), the same reason
-    // wave_reduce() in hip_reduce.h guards them. The radix path only dispatches
-    // on wave64 (see radix_topk_applicable below), so non-GFX9 targets just
-    // need something that compiles and stays correct if it ever runs; speed
-    // there is irrelevant.
-    const int lane = static_cast<int>(__lane_id());
-    for(int off = 1; off < WARP_SIZE; off <<= 1)
-    {
-        T up = __shfl_up(x, off, WARP_SIZE);
-        if(lane >= off)
-            x += up;
-    }
-    return x;
-#endif
-}
-
-template <typename T>
-__device__ __forceinline__ T radix_wave_total_add(T x)
-{
-    return __builtin_bit_cast(
-        T,
-        __builtin_amdgcn_readlane(__builtin_bit_cast(int, radix_wave_scan_add(x)), WARP_SIZE - 1));
 }
 
 __device__ void blockReduceMax(float& val, int& idx)
@@ -730,16 +698,14 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
 // measured at 896 experts, going from top-4 to top-32 moves this kernel from
 // 4.7 to 5.0 us while grouped_topk_kernel goes from 4.4 to 18.7 us.
 //
-// Requirements, all enforced by the caller:
-//   * NUM_GRP == 1 -- grouped routers keep using grouped_topk_kernel, whose
-//     group reduction wants the scores in LDS
-//   * !isSoftmax -- the softmax path normalises over the whole row first
-//   * num_experts <= radix_topk_traits::Slots * WARP_SIZE * vec_size
+// Dispatch is intentionally limited to the measured Kimi-K3 contract on
+// gfx950: 896 experts, one expert group, sigmoid scoring, and top-16. Keeping
+// the gate independent of token count makes the output permutation stable
+// between decode and prefill.
 //
-// Selected experts are emitted in ascending expert order instead of descending
-// score order. The op does not fix that order: op_tests compares after sorting
-// by id, "this is useful when we don't care about the absolute position of the
-// val/idx".
+// Selected experts are emitted in deterministic j-major ballot order. The
+// grouped-topk API does not promise descending-score order, and the exact-shape
+// gate prevents a batch-size-dependent switch between output permutations.
 template <typename DTYPE_I, typename f32vec, bool need_renorm, bool isBiased>
 __global__ void
 grouped_topk_radix_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens, hidden_size]
@@ -770,12 +736,12 @@ grouped_topk_radix_kernel(DTYPE_I* __restrict__ gating_output,         // [num_t
     const int lane      = threadIdx.x;
     const int num_vec   = num_experts / vec_size;
 
-    // Issued ahead of the loads so the stores retire underneath HBM latency.
+    // Reuse one 256-bin histogram for every radix pass. The original four
+    // per-pass histograms consumed 4 KiB of LDS even though only one is live at
+    // a time; this keeps the one-wave block at 1 KiB.
 #pragma unroll
-    for(int p = 0; p < PASSES; ++p)
-#pragma unroll
-        for(int i = 0; i < BINS_PER_LANE; ++i)
-            bins[p * BINS + lane * BINS_PER_LANE + i] = 0u;
+    for(int i = 0; i < BINS_PER_LANE; ++i)
+        bins[lane * BINS_PER_LANE + i] = 0u;
 
     unsigned int key[SLOTS][vec_size];
     float weight[SLOTS][vec_size];
@@ -790,23 +756,42 @@ grouped_topk_radix_kernel(DTYPE_I* __restrict__ gating_output,         // [num_t
             const int v = s * WARP_SIZE + lane;
             live[s]     = v < num_vec;
             if(!live[s])
-                continue;
-            vec_i raw = reinterpret_cast<vec_i const*>(input_ptr)[v];
-            vec_i bias;
-            if constexpr(isBiased)
-                bias = reinterpret_cast<vec_i const*>(correction_bias)[v];
-#pragma unroll
-            for(int j = 0; j < vec_size; ++j)
             {
-                // Same instruction sequence as grouped_topk_kernel's phase 1,
-                // so the scores are bit-identical.
-                const float sig =
-                    __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * static_cast<float>(raw[j])));
-                // The routing weight is the pre-bias sigmoid; the bias only
-                // steers selection.
-                weight[s][j] = sig;
-                key[s][j]    = radix_mono_key(
-                    isBiased ? sig + static_cast<float>(bias[j]) : sig);
+#pragma unroll
+                for(int j = 0; j < vec_size; ++j)
+                {
+                    key[s][j]    = 0u;
+                    weight[s][j] = 0.0f;
+                }
+                continue;
+            }
+            vec_i raw = reinterpret_cast<vec_i const*>(input_ptr)[v];
+            if constexpr(isBiased)
+            {
+                vec_i bias = reinterpret_cast<vec_i const*>(correction_bias)[v];
+#pragma unroll
+                for(int j = 0; j < vec_size; ++j)
+                {
+                    // Same instruction sequence as grouped_topk_kernel's phase 1,
+                    // so the scores are bit-identical.
+                    const float sig =
+                        __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * static_cast<float>(raw[j])));
+                    // The routing weight is the pre-bias sigmoid; the bias only
+                    // steers selection.
+                    weight[s][j] = sig;
+                    key[s][j]    = radix_mono_key(sig + static_cast<float>(bias[j]));
+                }
+            }
+            else
+            {
+#pragma unroll
+                for(int j = 0; j < vec_size; ++j)
+                {
+                    const float sig =
+                        __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * static_cast<float>(raw[j])));
+                    weight[s][j] = sig;
+                    key[s][j]    = radix_mono_key(sig);
+                }
             }
         }
     }
@@ -822,11 +807,11 @@ grouped_topk_radix_kernel(DTYPE_I* __restrict__ gating_output,         // [num_t
     int need             = topk;
     int cnt              = 0;
 
-#pragma unroll
+#pragma nounroll
     for(int p = 0; p < PASSES; ++p)
     {
         const int shift       = 32 - BITS * (p + 1);
-        unsigned int* my_bins = bins + p * BINS;
+        unsigned int* my_bins = bins;
 
 #pragma unroll
         for(int s = 0; s < SLOTS; ++s)
@@ -866,8 +851,7 @@ grouped_topk_radix_kernel(DTYPE_I* __restrict__ gating_output,         // [num_t
             if(!found && before < need && need <= acc)
             {
                 found = true;
-                hit   = (static_cast<unsigned int>((BINS - 1) - (lane * BINS_PER_LANE + i))
-                       << 24) |
+                hit   = (static_cast<unsigned int>((BINS - 1) - (lane * BINS_PER_LANE + i)) << 24) |
                       (static_cast<unsigned int>(need - before) << 12) |
                       static_cast<unsigned int>(mine[i]);
             }
@@ -884,6 +868,15 @@ grouped_topk_radix_kernel(DTYPE_I* __restrict__ gating_output,         // [num_t
         // Boundary bucket exactly consumed: no finer digit can change the set.
         if(need == cnt)
             break;
+
+        // Every lane has consumed its owned bins. Reset before the next digit.
+        // The block is exactly one wave, but retain block barriers so this
+        // remains correct if the launch shape is changed later.
+        __syncthreads();
+#pragma unroll
+        for(int i = 0; i < BINS_PER_LANE; ++i)
+            bins[lane * BINS_PER_LANE + i] = 0u;
+        __syncthreads();
     }
 
     // ---- emit ----
@@ -936,7 +929,7 @@ grouped_topk_radix_kernel(DTYPE_I* __restrict__ gating_output,         // [num_t
     }
 
     const float scale =
-        need_renorm ? routed_scaling_factor / radix_wave_total_add(psum) : routed_scaling_factor;
+        need_renorm ? routed_scaling_factor / wave_reduce(psum, Sum{}) : routed_scaling_factor;
 
     float* w_out = topk_weights + token_idx * stride_tk;
     int* i_out   = topk_ids + token_idx * stride_tk;
@@ -1500,78 +1493,90 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 
 // use_radix already requires num_expert_group == 1 at runtime, so the guard here
 // only keeps the other NUM_GRP instantiations from being emitted.
-#define LAUNCHER_biased_grouped_topk_radix_kernel(VEC_F, NUM_GRP, need_renorm)                    \
-    if constexpr(NUM_GRP == 1)                                                                    \
-    {                                                                                             \
-        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                                     \
-            gating_output.dtype(), "biased_grouped_topk_radix_kernel", [&] {                       \
-                hipLaunchKernelGGL(                                                               \
-                    (aiter::grouped_topk_radix_kernel<scalar_t, VEC_F, need_renorm, true>),        \
-                    dim3(grid),                                                                   \
-                    dim3(block),                                                                  \
-                    shared_mem_size,                                                              \
-                    stream,                                                                       \
-                    reinterpret_cast<scalar_t*>(gating_output.data_ptr()),                         \
-                    reinterpret_cast<scalar_t*>(correction_bias.data_ptr()),                      \
-                    reinterpret_cast<float*>(topk_weights.data_ptr()),                             \
-                    reinterpret_cast<int*>(topk_ids.data_ptr()),                                   \
-                    stride_gating,                                                                \
-                    stride_tk,                                                                    \
-                    num_experts,                                                                  \
-                    topk,                                                                         \
-                    num_tokens,                                                                   \
-                    routed_scaling_factor);                                                       \
-            });                                                                                   \
+#define LAUNCHER_biased_grouped_topk_radix_kernel(VEC_F, NUM_GRP, need_renorm)              \
+    if constexpr(NUM_GRP == 1)                                                              \
+    {                                                                                       \
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                               \
+            gating_output.dtype(), "biased_grouped_topk_radix_kernel", [&] {                \
+                hipLaunchKernelGGL(                                                         \
+                    (aiter::grouped_topk_radix_kernel<scalar_t, VEC_F, need_renorm, true>), \
+                    dim3(grid),                                                             \
+                    dim3(block),                                                            \
+                    shared_mem_size,                                                        \
+                    stream,                                                                 \
+                    reinterpret_cast<scalar_t*>(gating_output.data_ptr()),                  \
+                    reinterpret_cast<scalar_t*>(correction_bias.data_ptr()),                \
+                    reinterpret_cast<float*>(topk_weights.data_ptr()),                      \
+                    reinterpret_cast<int*>(topk_ids.data_ptr()),                            \
+                    stride_gating,                                                          \
+                    stride_tk,                                                              \
+                    num_experts,                                                            \
+                    topk,                                                                   \
+                    num_tokens,                                                             \
+                    routed_scaling_factor);                                                 \
+            });                                                                             \
+    }                                                                                       \
+    else                                                                                    \
+    {                                                                                       \
+        AITER_CHECK(false, "radix top-k requires num_expert_group == 1");                   \
     }
 
-#define LAUNCHER_grouped_topk_radix_kernel(VEC_F, NUM_GRP, need_renorm)                           \
-    if constexpr(NUM_GRP == 1)                                                                    \
-    {                                                                                             \
-        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                                     \
-            gating_output.dtype(), "grouped_topk_radix_kernel", [&] {                              \
-                hipLaunchKernelGGL(                                                               \
-                    (aiter::grouped_topk_radix_kernel<scalar_t, VEC_F, need_renorm, false>),       \
-                    dim3(grid),                                                                   \
-                    dim3(block),                                                                  \
-                    shared_mem_size,                                                              \
-                    stream,                                                                       \
-                    reinterpret_cast<scalar_t*>(gating_output.data_ptr()),                         \
-                    nullptr,                                                                      \
-                    reinterpret_cast<float*>(topk_weights.data_ptr()),                             \
-                    reinterpret_cast<int*>(topk_ids.data_ptr()),                                   \
-                    stride_gating,                                                                \
-                    stride_tk,                                                                    \
-                    num_experts,                                                                  \
-                    topk,                                                                         \
-                    num_tokens,                                                                   \
-                    routed_scaling_factor);                                                       \
-            });                                                                                   \
+#define LAUNCHER_grouped_topk_radix_kernel(VEC_F, NUM_GRP, need_renorm)                      \
+    if constexpr(NUM_GRP == 1)                                                               \
+    {                                                                                        \
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                                \
+            gating_output.dtype(), "grouped_topk_radix_kernel", [&] {                        \
+                hipLaunchKernelGGL(                                                          \
+                    (aiter::grouped_topk_radix_kernel<scalar_t, VEC_F, need_renorm, false>), \
+                    dim3(grid),                                                              \
+                    dim3(block),                                                             \
+                    shared_mem_size,                                                         \
+                    stream,                                                                  \
+                    reinterpret_cast<scalar_t*>(gating_output.data_ptr()),                   \
+                    nullptr,                                                                 \
+                    reinterpret_cast<float*>(topk_weights.data_ptr()),                       \
+                    reinterpret_cast<int*>(topk_ids.data_ptr()),                             \
+                    stride_gating,                                                           \
+                    stride_tk,                                                               \
+                    num_experts,                                                             \
+                    topk,                                                                    \
+                    num_tokens,                                                              \
+                    routed_scaling_factor);                                                  \
+            });                                                                              \
+    }                                                                                        \
+    else                                                                                     \
+    {                                                                                        \
+        AITER_CHECK(false, "radix top-k requires num_expert_group == 1");                    \
     }
 
-#define LAUNCHER_biased_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)      \
-    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(gating_output.dtype(), "biased_grouped_topk_kernel", [&] {  \
-        hipLaunchKernelGGL(                                                                        \
-            (aiter::                                                                               \
-                 grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), \
-            dim3(grid),                                                                            \
-            dim3(block),                                                                           \
-            shared_mem_size,                                                                       \
-            stream,                                                                                \
-            reinterpret_cast<scalar_t*>(gating_output.data_ptr()),                                                    \
-            reinterpret_cast<scalar_t*>(correction_bias.data_ptr()),                                                  \
-            reinterpret_cast<float*>(topk_weights.data_ptr()),                                                        \
-            reinterpret_cast<int*>(topk_ids.data_ptr()),                                                              \
-            stride_gating,                                                                         \
-            stride_tk,                                                                             \
-            num_experts,                                                                           \
-            topk,                                                                                  \
-            topk_grp,                                                                              \
-            num_tokens,                                                                            \
-            routed_scaling_factor);                                                                \
-    });
+#define LAUNCHER_biased_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax) \
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                                     \
+        gating_output.dtype(), "biased_grouped_topk_kernel", [&] {                            \
+            hipLaunchKernelGGL((aiter::grouped_topk_kernel<scalar_t,                          \
+                                                           VEC_F,                             \
+                                                           NUM_GRP,                           \
+                                                           need_renorm,                       \
+                                                           isBiased,                          \
+                                                           isSoftmax>),                       \
+                               dim3(grid),                                                    \
+                               dim3(block),                                                   \
+                               shared_mem_size,                                               \
+                               stream,                                                        \
+                               reinterpret_cast<scalar_t*>(gating_output.data_ptr()),         \
+                               reinterpret_cast<scalar_t*>(correction_bias.data_ptr()),       \
+                               reinterpret_cast<float*>(topk_weights.data_ptr()),             \
+                               reinterpret_cast<int*>(topk_ids.data_ptr()),                   \
+                               stride_gating,                                                 \
+                               stride_tk,                                                     \
+                               num_experts,                                                   \
+                               topk,                                                          \
+                               topk_grp,                                                      \
+                               num_tokens,                                                    \
+                               routed_scaling_factor);                                        \
+        });
 
 #define LAUNCHER_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)             \
-    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(gating_output.dtype(), "grouped_topk_kernel", [&] {         \
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(gating_output.dtype(), "grouped_topk_kernel", [&] {       \
         hipLaunchKernelGGL(                                                                        \
             (aiter::                                                                               \
                  grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), \
@@ -1579,10 +1584,10 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             dim3(block),                                                                           \
             shared_mem_size,                                                                       \
             stream,                                                                                \
-            reinterpret_cast<scalar_t*>(gating_output.data_ptr()),                                                    \
+            reinterpret_cast<scalar_t*>(gating_output.data_ptr()),                                 \
             nullptr,                                                                               \
-            reinterpret_cast<float*>(topk_weights.data_ptr()),                                                        \
-            reinterpret_cast<int*>(topk_ids.data_ptr()),                                                              \
+            reinterpret_cast<float*>(topk_weights.data_ptr()),                                     \
+            reinterpret_cast<int*>(topk_ids.data_ptr()),                                           \
             stride_gating,                                                                         \
             stride_tk,                                                                             \
             num_experts,                                                                           \
@@ -1592,73 +1597,56 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             routed_scaling_factor);                                                                \
     });
 
-#define LAUNCHER_biased_grouped_topk_opt_sort_kernel(                             \
-    VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)                             \
-    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                         \
-        gating_output.dtype(), "biased_grouped_topk_opt_sort_kernel", [&] { \
-            hipLaunchKernelGGL((aiter::grouped_topk_opt_sort_kernel<scalar_t,     \
-                                                                    VEC_F,        \
-                                                                    NUM_GRP,      \
-                                                                    need_renorm,  \
-                                                                    isBiased,     \
-                                                                    isSoftmax>),  \
-                               dim3(grid),                                        \
-                               dim3(block),                                       \
-                               shared_mem_size,                                   \
-                               stream,                                            \
-                               reinterpret_cast<scalar_t*>(gating_output.data_ptr()),                \
-                               reinterpret_cast<scalar_t*>(correction_bias.data_ptr()),              \
-                               reinterpret_cast<float*>(topk_weights.data_ptr()),                    \
-                               reinterpret_cast<int*>(topk_ids.data_ptr()),                          \
-                               stride_gating,                                     \
-                               stride_tk,                                         \
-                               num_experts,                                       \
-                               topk,                                              \
-                               topk_grp,                                          \
-                               num_tokens,                                        \
-                               routed_scaling_factor);                            \
+#define LAUNCHER_biased_grouped_topk_opt_sort_kernel(                                   \
+    VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)                                   \
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                               \
+        gating_output.dtype(), "biased_grouped_topk_opt_sort_kernel", [&] {             \
+            hipLaunchKernelGGL((aiter::grouped_topk_opt_sort_kernel<scalar_t,           \
+                                                                    VEC_F,              \
+                                                                    NUM_GRP,            \
+                                                                    need_renorm,        \
+                                                                    isBiased,           \
+                                                                    isSoftmax>),        \
+                               dim3(grid),                                              \
+                               dim3(block),                                             \
+                               shared_mem_size,                                         \
+                               stream,                                                  \
+                               reinterpret_cast<scalar_t*>(gating_output.data_ptr()),   \
+                               reinterpret_cast<scalar_t*>(correction_bias.data_ptr()), \
+                               reinterpret_cast<float*>(topk_weights.data_ptr()),       \
+                               reinterpret_cast<int*>(topk_ids.data_ptr()),             \
+                               stride_gating,                                           \
+                               stride_tk,                                               \
+                               num_experts,                                             \
+                               topk,                                                    \
+                               topk_grp,                                                \
+                               num_tokens,                                              \
+                               routed_scaling_factor);                                  \
         });
 
 namespace {
-// Vector width LAUNCH_KERNEL will select for this expert count.
-inline int radix_vec_width(int num_experts)
+inline bool radix_topk_gfx950()
 {
-    return (num_experts % 4 == 0) ? 4 : ((num_experts % 4 == 2) ? 2 : 1);
+    static const bool value = (get_gpu_arch() == "gfx950");
+    return value;
 }
 
 // Whether grouped_topk_radix_kernel should take over from grouped_topk_kernel.
 //
-// grouped_topk_kernel pays topk * ceil(num_experts / (WARP_SIZE * vec_size))
-// serial selection rounds; grouped_topk_radix_kernel pays a roughly fixed two
-// radix passes. So the new kernel wins by more the larger that product is, and
-// the gate only claims the range where it was measured to win on MI355X
-// (gfx950, ungrouped, tokens 1..4096):
-//
-//   topk >= 16  wins everywhere, 1.35x-4.3x  (Kimi-K3 896/top16: 2.06x at one
-//               token, 1.35x at 4096)
-//   topk == 8   wins 1.04x-1.27x up to 512 experts while tokens are few, but
-//               loses ~7% once the GPU saturates (Kimi-K2.5 384/top8 is 1.27x
-//               at one token and 0.93x at 4096), so it is claimed only below
-//               that point
-//   topk <= 4   a wash or a slight loss, never claimed
+// Keep this a pure function of the model shape and architecture. In
+// particular, never switch output permutation based on the token count.
 inline bool radix_topk_applicable(
-    int num_experts, int topk, int num_expert_group, bool is_softmax, int num_tokens)
+    int num_experts, int topk, int num_expert_group, int topk_group, bool is_softmax)
 {
-    if(num_expert_group != 1 || is_softmax)
+    if(topk > num_experts || !radix_topk_gfx950())
         return false;
-    if(get_warp_size_func() != 64)
-        return false;
-    if(num_experts > aiter::radix_topk_traits::Slots * 64 * radix_vec_width(num_experts))
-        return false;
-    if(topk >= 16)
-        return true;
-    return topk >= 8 && num_experts <= 512 && num_tokens <= 1024;
+    return num_experts == 896 && topk == 16 && num_expert_group == 1 && topk_group == 1 &&
+           !is_softmax && get_warp_size_func() == 64;
 }
 
 constexpr size_t radix_shared_mem_size()
 {
-    return static_cast<size_t>(aiter::radix_topk_traits::Passes) * aiter::radix_topk_traits::Bins *
-           sizeof(unsigned int);
+    return static_cast<size_t>(aiter::radix_topk_traits::Bins) * sizeof(unsigned int);
 }
 } // namespace
 
@@ -1671,13 +1659,13 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
                          bool need_renorm,
                          const float routed_scaling_factor)
 {
-    const bool isBiased = true;
-    bool isSoftmax      = false;
-    int num_tokens      = gating_output.size(0);
-    int num_experts     = gating_output.size(1);
-    int topk            = topk_ids.size(1);
+    const bool isBiased  = true;
+    bool isSoftmax       = false;
+    int num_tokens       = gating_output.size(0);
+    int num_experts      = gating_output.size(1);
+    int topk             = topk_ids.size(1);
     size_t stride_gating = gating_output.stride(0);
-    size_t stride_tk    = topk_ids.stride(0);
+    size_t stride_tk     = topk_ids.stride(0);
     AITER_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     AITER_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
@@ -1690,12 +1678,12 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
                         (topk_grp == 4) && (isBiased == true) && (get_warp_size_func() == 64);
     const bool use_radix =
-        radix_topk_applicable(num_experts, topk, num_expert_group, isSoftmax, num_tokens);
+        radix_topk_applicable(num_experts, topk, num_expert_group, topk_grp, isSoftmax);
 
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
-    size_t shared_mem_size =
-        (2 * num_experts * sizeof(float) + num_expert_group * sizeof(float)); // additional buf for sig_scores
+    size_t shared_mem_size = (2 * num_experts * sizeof(float) +
+                              num_expert_group * sizeof(float)); // additional buf for sig_scores
     shared_mem_size += !use_opt_sort
                            ? 0
                            : (num_expert_group * sizeof(int) /*group_map_idx*/
@@ -1726,13 +1714,13 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
                   bool is_softmax,
                   const float routed_scaling_factor)
 {
-    const bool isBiased  = false;
-    bool isSoftmax       = is_softmax;
-    int num_tokens       = gating_output.size(0);
-    int num_experts      = gating_output.size(1);
-    int topk             = topk_ids.size(1);
-    size_t stride_gating = gating_output.stride(0);
-    size_t stride_tk     = topk_ids.stride(0);
+    const bool isBiased                   = false;
+    bool isSoftmax                        = is_softmax;
+    int num_tokens                        = gating_output.size(0);
+    int num_experts                       = gating_output.size(1);
+    int topk                              = topk_ids.size(1);
+    size_t stride_gating                  = gating_output.stride(0);
+    size_t stride_tk                      = topk_ids.stride(0);
     const aiter_tensor_t& correction_bias = topk_ids;
     AITER_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     AITER_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
@@ -1744,7 +1732,7 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
     // TODO: expand usage in the future
     bool use_opt_sort = false;
     const bool use_radix =
-        radix_topk_applicable(num_experts, topk, num_expert_group, isSoftmax, num_tokens);
+        radix_topk_applicable(num_experts, topk, num_expert_group, topk_grp, isSoftmax);
 
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());

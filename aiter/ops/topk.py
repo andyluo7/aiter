@@ -85,7 +85,8 @@ def biased_grouped_topk_hip(
     topk_grp: int,
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,
-) -> None: ...
+) -> None:
+    """Write selected experts and weights; output slot order is unspecified."""
 
 
 @compile_ops("module_moe_asm", develop=True)
@@ -98,7 +99,8 @@ def grouped_topk(
     need_renorm: bool,
     is_softmax: bool = True,
     routed_scaling_factor: float = 1.0,
-) -> None: ...
+) -> None:
+    """Write selected experts and weights; output slot order is unspecified."""
 
 
 def gen_moe_fused_gate_fake_tensor(

@@ -167,6 +167,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_mla_v4_kargpreld.py]=3
     FILE_TIMES[op_tests/test_mxfp8fp4gemm.py]=3
     FILE_TIMES[op_tests/test_pa_decode_bf16_asm.py]=3
+    FILE_TIMES[op_tests/test_grouped_topk_radix.py]=20
     FILE_TIMES[op_tests/test_pretune.py]=1
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     echo "Triton test files:"
