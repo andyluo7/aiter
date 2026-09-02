@@ -137,6 +137,7 @@ def test_exact_kimi_k3_contract() -> None:
         (1, torch.float32, True, 2.827),
         (2, torch.bfloat16, False, 1.0),
         (2, torch.float32, False, 1.0),
+        (4, torch.float32, True, 2.827),
         (7, torch.bfloat16, True, 2.827),
         (7, torch.float32, True, 2.827),
         (14, torch.bfloat16, True, 1.0),
@@ -267,10 +268,9 @@ def test_dispatch_order_canary() -> None:
     )
 
 
-def _exercise_changed_input_graph_replay(dtype: torch.dtype) -> None:
-    m = 7
-    static_logits = _make_logits(m, dtype, seed=3307)
-    static_bias = _make_bias(dtype, seed=3308)
+def _exercise_changed_input_graph_replay(m: int, dtype: torch.dtype) -> None:
+    static_logits = _make_logits(m, dtype, seed=3300 + m)
+    static_bias = _make_bias(dtype, seed=3400 + m)
     weights, ids, _, _ = _make_outputs(m)
 
     warmup_stream = torch.cuda.Stream()
@@ -289,7 +289,7 @@ def _exercise_changed_input_graph_replay(dtype: torch.dtype) -> None:
         )
 
     previous_ids = None
-    for seed in (4407, 5507):
+    for seed in (4400 + m, 5500 + m):
         changed_logits = _make_logits(m, dtype, seed=seed)
         changed_bias = _make_bias(dtype, seed=seed + 1)
         static_logits.copy_(changed_logits)
@@ -313,10 +313,15 @@ def _exercise_changed_input_graph_replay(dtype: torch.dtype) -> None:
 
 def test_changed_input_graph_replay() -> None:
     # Kimi-K3's vLLM GateLinear and correction bias are FP32. Keep BF16 here
-    # as coverage for direct AITER callers, but require the actual serving
-    # dtype to pass capture and changed-input replay as well.
-    for dtype in (torch.bfloat16, torch.float32):
-        _exercise_changed_input_graph_replay(dtype)
+    # at the historical M=7 shape as coverage for direct AITER callers, but
+    # require the actual serving dtype to pass capture and changed-input replay
+    # at both the six-draft M=7 and three-draft M=4 decode shapes.
+    for m, dtype in (
+        (7, torch.bfloat16),
+        (4, torch.float32),
+        (7, torch.float32),
+    ):
+        _exercise_changed_input_graph_replay(m, dtype)
 
 
 def main() -> None:
